@@ -2,6 +2,8 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
+const DELIMITER: &[u8] = b"\r\n";
+
 #[tokio::main]
 async fn main() {
     let listener = TcpListener::bind("127.0.0.1:6379").await
@@ -21,19 +23,20 @@ async fn handle_connection(mut stream: TcpStream, _addr: SocketAddr) -> Option<(
         let command = read_command(&mut stream).await?;
         if command.len() == 0 {
             eprintln!("received a command of size 0");
-            return None;
+            continue;
         }
         let (command_name, command_params) = command.split_first().unwrap();
         let command_name = match std::str::from_utf8(command_name) {
             Ok(x) => x,
             Err(error) => {
                 eprintln!("failed to parse the received command name: {error}");
-                return None;
+                continue;
             }
         };
         let command_name = command_name.to_ascii_uppercase();
         match command_name.as_str() {
             "PING" => handle_ping(&mut stream).await?,
+            "ECHO" => handle_echo(&mut stream, command_params).await?,
             _ => {
                 eprintln!("received unknown command {command_name}");
             },
@@ -107,7 +110,6 @@ async fn read_binary_string_size(reader: &mut (impl AsyncBufReadExt + Unpin)) ->
 }
 
 async fn read_binary_string_body(reader: &mut (impl AsyncBufReadExt + Unpin), expected_size: usize) -> Option<Vec<u8>> {
-    const DELIMITER: &[u8] = b"\r\n";
     let mut result = vec![0; expected_size + DELIMITER.len()];
     let res = reader.read_exact(&mut result).await;
     if let Err(err) = res {
@@ -123,9 +125,40 @@ async fn read_binary_string_body(reader: &mut (impl AsyncBufReadExt + Unpin), ex
 }
 
 async fn handle_ping(stream: &mut TcpStream) -> Option<()> {
-    let result = stream.write_all(b"+PONG\r\n").await;
+    write_simple_string(stream, "PONG").await
+}
+
+async fn handle_echo(stream: &mut TcpStream, params: &[Vec<u8>]) -> Option<()> {
+    if params.len() < 1 {
+        eprintln!("echo command is missing arguments");
+        return Some(());
+    }
+    write_binary_string(stream, &params[0]).await
+}
+
+async fn write_simple_string(stream: &mut TcpStream, string: &str) -> Option<()> {
+    let result = stream.write_all(format!("+{string}\r\n").as_bytes()).await;
     if let Err(error) = result {
-        eprintln!("failed to write response: {error}");
+        eprintln!("failed to write simple string: {error}");
+        return None;
+    }
+    Some(())
+}
+
+async fn write_binary_string(stream: &mut TcpStream, string: &[u8]) -> Option<()> {
+    let result = stream.write_all(format!("${}\r\n", string.len()).as_bytes()).await;
+    if let Err(error) = result {
+        eprintln!("failed to write binary string size: {error}");
+        return None;
+    }
+    let result = stream.write_all(string).await;
+    if let Err(error) = result {
+        eprintln!("failed to write binary string body: {error}");
+        return None;
+    }
+    let result = stream.write_all(DELIMITER).await;
+    if let Err(error) = result {
+        eprintln!("failed to write binary string delimiter: {error}");
         return None;
     }
     Some(())
