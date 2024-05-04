@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::io::BufReader;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::timeout;
 use crate::resp::*;
 
 mod resp;
@@ -21,7 +23,17 @@ async fn main() {
 
 async fn handle_connection(mut stream: TcpStream, _addr: SocketAddr) -> Option<()> {
     loop {
-        let command = read_command(&mut BufReader::new(&mut stream)).await?;
+        let command = timeout(
+            Duration::from_millis(1000),
+            read_command(&mut BufReader::new(&mut stream))
+        ).await;
+        let command = match command {
+            Ok(x) => x?,
+            Err(_) => {
+                eprintln!("read timed out");
+                return None;
+            }
+        };
         if command.len() == 0 {
             eprintln!("received a command of size 0");
             continue;
@@ -35,17 +47,30 @@ async fn handle_connection(mut stream: TcpStream, _addr: SocketAddr) -> Option<(
             }
         };
         let command_name = command_name.to_ascii_uppercase();
-        let can_continue = match command_name.as_str() {
-            "PING" => handle_ping(&mut stream).await,
-            "ECHO" => handle_echo(&mut stream, command_params).await,
-            _ => {
-                eprintln!("received unknown command {command_name}");
-                true
-            },
-        };
-        if !can_continue {
-            return None;
+
+        let can_continue = timeout(
+            Duration::from_millis(1000),
+            handle_command(&mut stream, &command_name, command_params)
+        ).await;
+        match can_continue {
+            Ok(true) => {},
+            Ok(false) => return None,
+            Err(_) => {
+                eprintln!("response timed out");
+                return None;
+            }
         }
+    }
+}
+
+async fn handle_command(mut stream: &mut TcpStream, command_name: &str, command_params: &[Vec<u8>]) -> bool {
+    match command_name {
+        "PING" => handle_ping(&mut stream).await,
+        "ECHO" => handle_echo(&mut stream, command_params).await,
+        _ => {
+            eprintln!("received unknown command {command_name}");
+            true
+        },
     }
 }
 
