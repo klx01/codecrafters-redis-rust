@@ -110,12 +110,12 @@ pub(crate) async fn write_simple_string(stream: &mut (impl AsyncWriteExt + Unpin
 
 pub(crate) async fn write_binary_string_or_null(stream: &mut (impl AsyncWriteExt + Unpin), string: Option<impl AsRef<[u8]>>) -> Option<()> {
     match string {
-        Some(value) => write_binary_string(stream, &value).await,
+        Some(value) => write_binary_string(stream, &value, true).await,
         None => write_null(stream).await,
     }
 }
 
-pub(crate) async fn write_binary_string(stream: &mut (impl AsyncWriteExt + Unpin), string: impl AsRef<[u8]>) -> Option<()> {
+pub(crate) async fn write_binary_string(stream: &mut (impl AsyncWriteExt + Unpin), string: impl AsRef<[u8]>, with_delimiter: bool) -> Option<()> {
     let string = string.as_ref();
     let result = stream.write_all(format!("${}{DELIMITER_STR}", string.len()).as_bytes()).await;
     if let Err(error) = result {
@@ -127,10 +127,12 @@ pub(crate) async fn write_binary_string(stream: &mut (impl AsyncWriteExt + Unpin
         eprintln!("failed to write binary string body: {error}");
         return None;
     }
-    let result = stream.write_all(DELIMITER_BYTES).await;
-    if let Err(error) = result {
-        eprintln!("failed to write binary string delimiter: {error}");
-        return None;
+    if with_delimiter {
+        let result = stream.write_all(DELIMITER_BYTES).await;
+        if let Err(error) = result {
+            eprintln!("failed to write binary string delimiter: {error}");
+            return None;
+        }   
     }
     Some(())
 }
@@ -152,7 +154,7 @@ pub(crate) async fn write_array_of_strings<S: AsRef<[u8]>>(stream: &mut (impl As
         return None;
     }
     for string in strings {
-        write_binary_string(stream, string).await?;
+        write_binary_string(stream, string, true).await?;
     }
     Some(())
 }

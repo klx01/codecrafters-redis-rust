@@ -4,6 +4,8 @@ use crate::ServerInfo;
 use crate::resp::{write_binary_string, write_binary_string_or_null, write_simple_string};
 use crate::storage::{Storage, StorageItem};
 
+const EMPTY_RDB_FILE_HEX: &str = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
+
 pub(crate) async fn handle_command(stream: &mut TcpStream, command_name: &str, command_params: &[Vec<u8>], storage: &Storage, server_info: &ServerInfo) -> Option<()> {
     let command_name = command_name.to_ascii_uppercase();
     match command_name.as_str() {
@@ -30,7 +32,7 @@ async fn echo(stream: &mut TcpStream, params: &[Vec<u8>]) -> Option<()> {
         eprintln!("echo command is missing arguments");
         return Some(());
     }
-    write_binary_string(stream, &params[0]).await
+    write_binary_string(stream, &params[0], true).await
 }
 
 async fn get(stream: &mut TcpStream, params: &[Vec<u8>], storage: &Storage) -> Option<()> {
@@ -114,7 +116,7 @@ master_repl_offset:{}
         info.replication_id,
         info.replication_offset,
     );
-    write_binary_string(stream, result).await
+    write_binary_string(stream, result, true).await
 }
 
 async fn repl_conf(stream: &mut TcpStream, params: &[Vec<u8>]) -> Option<()> {
@@ -165,5 +167,7 @@ async fn psync(stream: &mut TcpStream, params: &[Vec<u8>], info: &ServerInfo) ->
         eprintln!("unexpected psync offset argument");
         return Some(());
     }
-    write_simple_string(stream, format!("FULLRESYNC {} 0", info.replication_id)).await
+    write_simple_string(stream, format!("FULLRESYNC {} 0", info.replication_id)).await?;
+    let file_contents = hex::decode(EMPTY_RDB_FILE_HEX).unwrap();
+    write_binary_string(stream, file_contents, false).await
 }
