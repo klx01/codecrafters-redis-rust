@@ -20,7 +20,7 @@ struct Cli {
 async fn main() {
     let cli = Cli::parse();
     let port = cli.port.unwrap_or(6379);
-    
+
     let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await
         .expect(format!("Failed to bind to the port {port}").as_str());
 
@@ -78,12 +78,13 @@ async fn handle_connection(mut stream: TcpStream, storage: Arc<Storage>) -> Opti
     }
 }
 
-async fn handle_command(mut stream: &mut TcpStream, command_name: &str, command_params: &[Vec<u8>], storage: &Storage) -> bool {
+async fn handle_command(stream: &mut TcpStream, command_name: &str, command_params: &[Vec<u8>], storage: &Storage) -> bool {
     match command_name {
-        "PING" => handle_ping(&mut stream).await,
-        "ECHO" => handle_echo(&mut stream, command_params).await,
-        "GET" => handle_get(&mut stream, command_params, storage).await,
-        "SET" => handle_set(&mut stream, command_params, storage).await,
+        "PING" => handle_ping(stream).await,
+        "ECHO" => handle_echo(stream, command_params).await,
+        "GET" => handle_get(stream, command_params, storage).await,
+        "SET" => handle_set(stream, command_params, storage).await,
+        "INFO" => handle_info(stream, command_params, storage).await,
         _ => {
             eprintln!("received unknown command {command_name}");
             true
@@ -161,4 +162,28 @@ fn get_expiry(params: &[Vec<u8>]) -> Option<Option<Instant>> {
     };
     let expires_at = Instant::now() + Duration::from_millis(expiry_value);
     Some(Some(expires_at))
+}
+
+async fn handle_info(stream: &mut TcpStream, params: &[Vec<u8>], _storage: &Storage) -> bool {
+    for section in params {
+        let can_continue = match section.as_slice() {
+            b"replication" => info_replication(stream).await,
+            _ => {
+                eprintln!("Unknown section {:?}", std::str::from_utf8(section));
+                true
+            }
+        };
+        if !can_continue {
+            return false;
+        }
+    }
+    true
+}
+
+async fn info_replication(stream: &mut TcpStream) -> bool {
+    let strings = [
+        "# Replication",
+        "role:master",
+    ];
+    write_array_of_strings(stream, &strings).await
 }
