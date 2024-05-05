@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use clap::Parser;
 use tokio::io::BufReader;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -9,10 +10,19 @@ use crate::storage::*;
 mod resp;
 mod storage;
 
+#[derive(Parser)]
+struct Cli {
+    #[arg(long)]
+    port: Option<u16>,
+}
+
 #[tokio::main]
 async fn main() {
-    let listener = TcpListener::bind("127.0.0.1:6379").await
-        .expect("Failed to bind to the port");
+    let cli = Cli::parse();
+    let port = cli.port.unwrap_or(6379);
+    
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await
+        .expect(format!("Failed to bind to the port {port}").as_str());
 
     let storage = Arc::new(Storage::default());
 

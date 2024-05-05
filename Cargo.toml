@@ -23,6 +23,7 @@ anyhow = "^1"                                   # error handling
 bytes = "^1"                                     # helps manage buffers
 thiserror = "^1"                                # error handling
 tokio = { version = "^1", features = ["full"] } # async networking
+clap = { version = "^4", features = ["derive"]}
 
 [profile.release]
 strip = "none"
