@@ -20,6 +20,8 @@ struct Cli {
 
 struct Info {
     is_slave: bool,
+    replication_id: String,
+    replication_offset: usize,
 }
 
 #[tokio::main]
@@ -36,7 +38,11 @@ async fn main() {
     }  else {
         false
     };
-    let info = Info{is_slave};
+    let info = Info{
+        is_slave,
+        replication_id: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(),
+        replication_offset: 0,
+    };
 
     let port = cli.port.unwrap_or(6379);
     let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await
@@ -201,10 +207,15 @@ async fn handle_info(stream: &mut TcpStream, params: &[Vec<u8>], info: &Info, _s
 }
 
 async fn info_replication(stream: &mut TcpStream, info: &Info) -> bool {
-    let role = if info.is_slave {
-        "role:slave"
-    } else {
-        "role:master"
-    };
-    write_binary_string(stream, role).await
+    let result = format!(
+"# Replication
+role:{}
+master_replid:{}
+master_repl_offset:{}
+",
+        if info.is_slave { "slave" } else { "master" },
+        info.replication_id,
+        info.replication_offset,
+    );
+    write_binary_string(stream, result).await
 }

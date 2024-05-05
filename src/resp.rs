@@ -128,7 +128,7 @@ pub(crate) async fn write_null(stream: &mut (impl AsyncWriteExt + Unpin)) -> boo
     true
 }
 
-pub(crate) async fn write_array_of_strings(stream: &mut (impl AsyncWriteExt + Unpin), strings: &[impl AsRef<[u8]>]) -> bool {
+pub(crate) async fn _write_array_of_strings(stream: &mut (impl AsyncWriteExt + Unpin), strings: &[impl AsRef<[u8]>]) -> bool {
     let result = stream.write_all(format!("*{}{DELIMITER_STR}", strings.len()).as_bytes()).await;
     if let Err(error) = result {
         eprintln!("failed to write array size: {error}");
