@@ -13,6 +13,7 @@ pub(crate) async fn handle_command(stream: &mut TcpStream, command_name: &str, c
         "SET" => set(stream, command_params, storage).await,
         "INFO" => info(stream, command_params, server_info, storage).await,
         "REPLCONF" => repl_conf(stream, command_params).await,
+        "PSYNC" => psync(stream, command_params, server_info).await,
         _ => {
             eprintln!("received unknown command {command_name}");
             Some(())
@@ -149,4 +150,20 @@ async fn repl_conf(stream: &mut TcpStream, params: &[Vec<u8>]) -> Option<()> {
             return Some(());
         }
     }
+}
+
+async fn psync(stream: &mut TcpStream, params: &[Vec<u8>], info: &ServerInfo) -> Option<()> {
+    if params.len() < 2 {
+        eprintln!("psync command is missing arguments");
+        return Some(());
+    }
+    if params[0].as_slice() != b"?"{
+        eprintln!("unexpected psync id argument");
+        return Some(());
+    }
+    if params[1].as_slice() != b"-1"{
+        eprintln!("unexpected psync offset argument");
+        return Some(());
+    }
+    write_simple_string(stream, format!("FULLRESYNC {} 0", info.replication_id)).await
 }
