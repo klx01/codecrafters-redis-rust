@@ -181,9 +181,5 @@ async fn handle_info(stream: &mut TcpStream, params: &[Vec<u8>], _storage: &Stor
 }
 
 async fn info_replication(stream: &mut TcpStream) -> bool {
-    let strings = [
-        "# Replication",
-        "role:master",
-    ];
-    write_array_of_strings(stream, &strings).await
+    write_binary_string(stream, "role:master").await
 }
