@@ -1,18 +1,44 @@
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use crate::ServerInfo;
-use crate::resp::{write_binary_string, write_binary_string_or_null, write_simple_string};
+use crate::resp::{exec_with_timeout, write_binary_string, write_binary_string_or_null, write_simple_string};
 use crate::storage::{Storage, StorageItem};
 
 const EMPTY_RDB_FILE_HEX: &str = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
 
-pub(crate) async fn handle_command(stream: &mut TcpStream, command_name: &str, command_params: &[Vec<u8>], storage: &Storage, server_info: &ServerInfo) -> Option<()> {
+pub(crate) async fn handle_command(stream: &mut TcpStream, command: &[Vec<u8>], storage: &Storage, server_info: &ServerInfo, is_connection_with_master: bool) -> Option<()> {
+    if command.len() == 0 {
+        eprintln!("received a command of size 0");
+        return Some(());
+    }
+    let (command_name, command_params) = command.split_first().unwrap();
+    let command_name = match std::str::from_utf8(command_name) {
+        Ok(x) => x,
+        Err(error) => {
+            eprintln!("failed to parse the received command name: {error}");
+            return Some(());
+        }
+    };
+    let command_name = command_name.to_ascii_uppercase();
+    let write_result = exec_with_timeout(
+        handle_command_inner(stream, &command_name, &command_params, &storage, &server_info, is_connection_with_master)
+    ).await;
+    match write_result {
+        Ok(x) => x,
+        Err(_) => {
+            eprintln!("response timed out");
+            return None;
+        }
+    }
+}
+
+async fn handle_command_inner(stream: &mut TcpStream, command_name: &str, command_params: &[Vec<u8>], storage: &Storage, server_info: &ServerInfo, is_connection_with_master: bool) -> Option<()> {
     let command_name = command_name.to_ascii_uppercase();
     match command_name.as_str() {
         "PING" => ping(stream).await,
         "ECHO" => echo(stream, command_params).await,
         "GET" => get(stream, command_params, storage).await,
-        "SET" => set(stream, command_params, storage).await,
+        "SET" => set(stream, command_params, storage, server_info, is_connection_with_master).await,
         "INFO" => info(stream, command_params, server_info, storage).await,
         "REPLCONF" => repl_conf(stream, command_params).await,
         "PSYNC" => psync(stream, command_params, server_info).await,
@@ -44,7 +70,11 @@ async fn get(stream: &mut TcpStream, params: &[Vec<u8>], storage: &Storage) -> O
     write_binary_string_or_null(stream, result).await
 }
 
-async fn set(stream: &mut TcpStream, params: &[Vec<u8>], storage: &Storage) -> Option<()> {
+async fn set(stream: &mut TcpStream, params: &[Vec<u8>], storage: &Storage, server_info: &ServerInfo, is_connection_with_master: bool) -> Option<()> {
+    if server_info.is_slave && !is_connection_with_master {
+        eprintln!("set command was called for slave by non-master");
+        return Some(());
+    }
     if params.len() < 2 {
         eprintln!("set command is missing arguments");
         return Some(());
@@ -56,7 +86,11 @@ async fn set(stream: &mut TcpStream, params: &[Vec<u8>], storage: &Storage) -> O
         expires_at: parse_expiry(params)?,
     };
     storage.set(key.clone(), item);
-    write_simple_string(stream, "OK").await
+    if server_info.is_slave {
+        Some(())
+    } else {
+        write_simple_string(stream, "OK").await
+    }
 }
 
 fn parse_expiry(params: &[Vec<u8>]) -> Option<Option<Instant>> {
@@ -140,7 +174,9 @@ async fn repl_conf(stream: &mut TcpStream, params: &[Vec<u8>]) -> Option<()> {
                 }
             };
             match port.parse::<u16>() {
-                Ok(_) => write_simple_string(stream, "OK").await,
+                Ok(_) => { 
+                    write_simple_string(stream, "OK").await 
+                },
                 Err(error) => {
                     eprintln!("slave port is not a valid int {error}");
                     Some(())

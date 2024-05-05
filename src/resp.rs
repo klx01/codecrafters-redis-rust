@@ -1,15 +1,35 @@
+use std::future::Future;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::time::error::Elapsed;
+use tokio::time::timeout;
 
 const DELIMITER_STR: &str = "\r\n";
 const DELIMITER_BYTES: &[u8] = DELIMITER_STR.as_bytes();
 
 pub(crate) async fn read_command(reader: &mut (impl AsyncBufReadExt + Unpin)) -> Option<Vec<Vec<u8>>> {
+    /*
+    Only the very first read does not have a timeout.
+    Because we are reading only a very small amounts of data,
+    and because pauses between messages are expected.
+    Later reads have a timeout, to protect against clients that would make us allocate memory and hold it
+    and because pauses there are not expected.
+     */
     let array_size = read_command_array_size(reader).await?;
-    let mut command = Vec::with_capacity(array_size);
-    for _ in 0..array_size {
-        command.push(read_binary_string(reader).await?)
+    let command = exec_with_timeout(async move {
+        let mut command = Vec::with_capacity(array_size);
+        for _ in 0..array_size {
+            command.push(read_binary_string(reader, true).await?)
+        }
+        Some(command)
+    }).await;
+    match command {
+        Ok(x) => x,
+        Err(_) => {
+            eprintln!("read timed out");
+            return None;
+        }
     }
-    Some(command)
 }
 
 async fn read_command_array_size(reader: &mut (impl AsyncBufReadExt + Unpin)) -> Option<usize> {
@@ -52,27 +72,33 @@ async fn read_int(reader: &mut (impl AsyncBufReadExt + Unpin), expected_type_pre
     Some(int)
 }
 
-async fn read_binary_string(reader: &mut (impl AsyncBufReadExt + Unpin)) -> Option<Vec<u8>> {
+pub(crate) async fn read_binary_string(reader: &mut (impl AsyncBufReadExt + Unpin), with_delimiter: bool) -> Option<Vec<u8>> {
     let size = read_binary_string_size(reader).await?;
-    read_binary_string_body(reader, size).await
+    read_binary_string_body(reader, size, with_delimiter).await
 }
 
 async fn read_binary_string_size(reader: &mut (impl AsyncBufReadExt + Unpin)) -> Option<usize> {
     return read_int(reader, "$", false, 300).await
 }
 
-async fn read_binary_string_body(reader: &mut (impl AsyncBufReadExt + Unpin), expected_size: usize) -> Option<Vec<u8>> {
-    let mut result = vec![0; expected_size + DELIMITER_BYTES.len()];
+async fn read_binary_string_body(reader: &mut (impl AsyncBufReadExt + Unpin), expected_size: usize, with_delimiter: bool) -> Option<Vec<u8>> {
+    let mut buffer_size = expected_size;
+    if with_delimiter {
+        buffer_size += DELIMITER_BYTES.len();
+    }
+    let mut result = vec![0; buffer_size];
     let res = reader.read_exact(&mut result).await;
     if let Err(err) = res {
         eprintln!("failed to read string line {err}");
         return None;
     }
-    if !result.ends_with(DELIMITER_BYTES) {
-        eprintln!("invalid format, string is missing the delimiter");
-        return None;
+    if with_delimiter {
+        if !result.ends_with(DELIMITER_BYTES) {
+            eprintln!("invalid format, string is missing the delimiter");
+            return None;
+        }
+        result.truncate(result.len() - DELIMITER_BYTES.len());   
     }
-    result.truncate(result.len() - DELIMITER_BYTES.len());
     Some(result)
 }
 
@@ -157,4 +183,8 @@ pub(crate) async fn write_array_of_strings<S: AsRef<[u8]>>(stream: &mut (impl As
         write_binary_string(stream, string, true).await?;
     }
     Some(())
+}
+
+pub(crate) async fn exec_with_timeout<R>(future: impl Future<Output = R>) -> Result<R, Elapsed> {
+    timeout(Duration::from_millis(1000), future).await
 }

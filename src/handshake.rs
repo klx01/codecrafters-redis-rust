@@ -1,10 +1,6 @@
-use std::future::Future;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::time::error::Elapsed;
-use tokio::time::timeout;
-use crate::resp::{read_simple_string, write_array_of_strings};
+use crate::resp::{exec_with_timeout, read_binary_string, read_simple_string, write_array_of_strings};
 
 pub(crate) async fn master_handshake(stream: &mut TcpStream, my_port: u16) -> (String, usize) {
     let buf = &mut [0u8; 512];
@@ -15,11 +11,17 @@ pub(crate) async fn master_handshake(stream: &mut TcpStream, my_port: u16) -> (S
     write(stream, ["REPLCONF", "capa", "psync2"]).await;
     read_expect(stream, buf, "+OK\r\n").await;
     write(stream, ["PSYNC", "?", "-1"]).await;
-    let master_config = exec_with_timeout(read_simple_string(&mut BufReader::new(stream), 100))
+    let mut reader = BufReader::new(stream);
+    let master_config = exec_with_timeout(read_simple_string(&mut reader, 100))
         .await
-        .expect("timeout when reading during handshake")
+        .expect("timeout when reading config during handshake")
         .unwrap();
-    parse_master_config(&master_config)
+    let result = parse_master_config(&master_config);
+    exec_with_timeout(read_binary_string(&mut reader, false))
+        .await
+        .expect("timeout when reading RDB file during handshake")
+        .unwrap();
+    result
 }
 
 async fn write<S: AsRef<[u8]>>(stream: &mut TcpStream, message: impl AsRef<[S]>) {
@@ -59,8 +61,4 @@ fn parse_master_config(buf: &str) -> (String, usize) {
     let offset = offset.parse()
         .expect("Failed to parse master offset");
     (id.to_string(), offset)
-}
-
-async fn exec_with_timeout<R>(future: impl Future<Output = R>) -> Result<R, Elapsed> {
-    timeout(Duration::from_millis(1000), future).await
 }
