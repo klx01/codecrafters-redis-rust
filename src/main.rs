@@ -1,10 +1,8 @@
-use std::net::SocketAddr;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use clap::Parser;
 use tokio::io::BufReader;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{lookup_host, TcpListener, TcpStream};
 use tokio::time::timeout;
 use crate::resp::*;
 use crate::storage::*;
@@ -30,8 +28,10 @@ async fn main() {
 
     let is_slave = if cli.replicaof.len() > 0 {
         let master_addr = format!("{}:{}", cli.replicaof[0], cli.replicaof[1]);
-        let _master_socket = SocketAddr::from_str(&master_addr)
-            .expect(format!("Invalid master address {master_addr}").as_str());
+        let _master_socket = lookup_host(&master_addr).await
+            .expect(format!("Failed to lookup the address of master host {master_addr}").as_str())
+            .next()
+            .expect(format!("No addresses found for master host {master_addr}").as_str());
         true
     }  else {
         false
