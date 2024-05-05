@@ -31,13 +31,14 @@ struct Info {
 async fn main() {
     let cli = Cli::parse();
 
+    let port = cli.port.unwrap_or(6379);
     let is_slave = if cli.replicaof.len() > 0 {
         let master_addr = format!("{}:{}", cli.replicaof[0], cli.replicaof[1]);
         let master_socket = lookup_host(&master_addr).await
             .expect(format!("Failed to lookup the address of master host {master_addr}").as_str())
             .next()
             .expect(format!("No addresses found for master host {master_addr}").as_str());
-        master_handshake(&master_socket).await;
+        master_handshake(&master_socket, port).await;
         true
     }  else {
         false
@@ -48,7 +49,6 @@ async fn main() {
         replication_offset: 0,
     };
 
-    let port = cli.port.unwrap_or(6379);
     let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await
         .expect(format!("Failed to bind to the port {port}").as_str());
 
@@ -66,25 +66,41 @@ async fn main() {
     }
 }
 
-async fn master_handshake(master_socket: &SocketAddr) {
-    let mut master_stream = TcpStream::connect(master_socket).await
+async fn master_handshake(master_socket: &SocketAddr, port: u16) {
+    let stream = &mut TcpStream::connect(master_socket).await
         .expect("failed to connect to master");
-    exec_with_timeout(write_array_of_strings(&mut master_stream, ["PING"]))
-        .await
-        .expect("handshake ping timed out")
-        .expect("failed to write handshake ping");
 
-    let mut buf = [0u8; 512];
-    let read_size = exec_with_timeout(master_stream.read(&mut buf))
+    let buf = &mut [0u8; 512];
+
+    handshake_write(stream, ["PING"]).await;
+    handshake_read(stream, buf, "+PONG\r\n").await;
+    handshake_write(stream, ["REPLCONF", "listening-port", port.to_string().as_str()]).await;
+    handshake_read(stream, buf, "+OK\r\n").await;
+    handshake_write(stream, ["REPLCONF", "capa", "psync2"]).await;
+    handshake_read(stream, buf, "+OK\r\n").await;
+}
+
+async fn handshake_write<S: AsRef<[u8]>>(stream: &mut TcpStream, message: impl AsRef<[S]>) {
+    exec_with_timeout(write_array_of_strings(stream, message))
         .await
-        .expect("handshake ping response timed out")
-        .expect("failed to read master's response to ping");
+        .expect("timeout when writing during handshake with master")
+        .expect("failed to write message during handshake with master");
+}
+
+async fn handshake_read(stream: &mut TcpStream, buf: &mut [u8], expected: &str) {
+    let read_size = exec_with_timeout(stream.read(buf))
+        .await
+        .expect("timeout when reading during handshake")
+        .expect("failed to read message during handshake");
     if read_size == 0 {
-        panic!("master did not respond to ping");
+        panic!("got EOF from master during handshake");
     }
     let response = &buf[..read_size];
-    if response != b"+PONG\r\n" {
-        panic!("unexpected response from master {:?}", std::str::from_utf8(response));
+    if response != expected.as_bytes() {
+        panic!(
+            "unexpected response from master: expected {expected}, got {:?}",
+            std::str::from_utf8(response)
+        );
     }
 }
 
