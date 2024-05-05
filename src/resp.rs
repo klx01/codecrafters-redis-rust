@@ -58,7 +58,7 @@ async fn read_binary_string(reader: &mut (impl AsyncBufReadExt + Unpin)) -> Opti
 }
 
 async fn read_binary_string_size(reader: &mut (impl AsyncBufReadExt + Unpin)) -> Option<usize> {
-    return read_int(reader, "$", true, 300).await
+    return read_int(reader, "$", false, 300).await
 }
 
 async fn read_binary_string_body(reader: &mut (impl AsyncBufReadExt + Unpin), expected_size: usize) -> Option<Vec<u8>> {

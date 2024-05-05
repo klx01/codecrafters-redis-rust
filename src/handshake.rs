@@ -15,7 +15,7 @@ pub(crate) async fn master_handshake(stream: &mut TcpStream, my_port: u16) -> (S
     write(stream, ["REPLCONF", "capa", "psync2"]).await;
     read_expect(stream, buf, "+OK\r\n").await;
     write(stream, ["PSYNC", "?", "-1"]).await;
-    let master_config = exec_with_timeout(read_simple_string(&mut BufReader::new(stream), 100)) 
+    let master_config = exec_with_timeout(read_simple_string(&mut BufReader::new(stream), 100))
         .await
         .expect("timeout when reading during handshake")
         .unwrap();
