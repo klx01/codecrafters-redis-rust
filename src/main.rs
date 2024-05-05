@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use clap::Parser;
@@ -14,29 +16,47 @@ mod storage;
 struct Cli {
     #[arg(long)]
     port: Option<u16>,
+    #[arg(long, num_args = 2, value_names=["master_host", "master_port"])]
+    replicaof: Vec<String>,
+}
+
+struct Info {
+    is_slave: bool,
 }
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let port = cli.port.unwrap_or(6379);
 
+    let is_slave = if cli.replicaof.len() > 0 {
+        let master_addr = format!("{}:{}", cli.replicaof[0], cli.replicaof[1]);
+        let _master_socket = SocketAddr::from_str(&master_addr)
+            .expect(format!("Invalid master address {master_addr}").as_str());
+        true
+    }  else {
+        false
+    };
+    let info = Info{is_slave};
+
+    let port = cli.port.unwrap_or(6379);
     let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await
         .expect(format!("Failed to bind to the port {port}").as_str());
 
     let storage = Arc::new(Storage::default());
+    let info = Arc::new(info);
 
     loop {
         let (stream, _addr) = listener.accept().await
             .expect("Failed to accept connection");
         let storage = Arc::clone(&storage);
+        let info = Arc::clone(&info);
         tokio::spawn(async move {
-            handle_connection(stream, storage).await
+            handle_connection(stream, storage, info).await
         });
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, storage: Arc<Storage>) -> Option<()> {
+async fn handle_connection(mut stream: TcpStream, storage: Arc<Storage>, info: Arc<Info>) -> Option<()> {
     loop {
         let command = timeout(
             Duration::from_millis(1000),
@@ -65,7 +85,7 @@ async fn handle_connection(mut stream: TcpStream, storage: Arc<Storage>) -> Opti
 
         let can_continue = timeout(
             Duration::from_millis(1000),
-            handle_command(&mut stream, &command_name, command_params, &storage)
+            handle_command(&mut stream, &command_name, command_params, &storage, &info)
         ).await;
         match can_continue {
             Ok(true) => {},
@@ -78,13 +98,13 @@ async fn handle_connection(mut stream: TcpStream, storage: Arc<Storage>) -> Opti
     }
 }
 
-async fn handle_command(stream: &mut TcpStream, command_name: &str, command_params: &[Vec<u8>], storage: &Storage) -> bool {
+async fn handle_command(stream: &mut TcpStream, command_name: &str, command_params: &[Vec<u8>], storage: &Storage, info: &Info) -> bool {
     match command_name {
         "PING" => handle_ping(stream).await,
         "ECHO" => handle_echo(stream, command_params).await,
         "GET" => handle_get(stream, command_params, storage).await,
         "SET" => handle_set(stream, command_params, storage).await,
-        "INFO" => handle_info(stream, command_params, storage).await,
+        "INFO" => handle_info(stream, command_params, info, storage).await,
         _ => {
             eprintln!("received unknown command {command_name}");
             true
@@ -164,10 +184,10 @@ fn get_expiry(params: &[Vec<u8>]) -> Option<Option<Instant>> {
     Some(Some(expires_at))
 }
 
-async fn handle_info(stream: &mut TcpStream, params: &[Vec<u8>], _storage: &Storage) -> bool {
+async fn handle_info(stream: &mut TcpStream, params: &[Vec<u8>], info: &Info, _storage: &Storage) -> bool {
     for section in params {
         let can_continue = match section.as_slice() {
-            b"replication" => info_replication(stream).await,
+            b"replication" => info_replication(stream, info).await,
             _ => {
                 eprintln!("Unknown section {:?}", std::str::from_utf8(section));
                 true
@@ -180,6 +200,11 @@ async fn handle_info(stream: &mut TcpStream, params: &[Vec<u8>], _storage: &Stor
     true
 }
 
-async fn info_replication(stream: &mut TcpStream) -> bool {
-    write_binary_string(stream, "role:master").await
+async fn info_replication(stream: &mut TcpStream, info: &Info) -> bool {
+    let role = if info.is_slave {
+        "role:slave"
+    } else {
+        "role:master"
+    };
+    write_binary_string(stream, role).await
 }
