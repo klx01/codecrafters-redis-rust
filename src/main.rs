@@ -1,23 +1,20 @@
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::BufReader;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use crate::resp::*;
+use crate::storage::*;
 
 mod resp;
-
-type Storage = HashMap<Vec<u8>, Vec<u8>>;
-type LockStorage = RwLock<Storage>;
-type ArcStorage = Arc<LockStorage>;
+mod storage;
 
 #[tokio::main]
 async fn main() {
     let listener = TcpListener::bind("127.0.0.1:6379").await
         .expect("Failed to bind to the port");
 
-    let storage: ArcStorage = Default::default();
+    let storage = Arc::new(Storage::default());
 
     loop {
         let (stream, _addr) = listener.accept().await
@@ -29,7 +26,7 @@ async fn main() {
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, storage: ArcStorage) -> Option<()> {
+async fn handle_connection(mut stream: TcpStream, storage: Arc<Storage>) -> Option<()> {
     loop {
         let command = timeout(
             Duration::from_millis(1000),
@@ -71,7 +68,7 @@ async fn handle_connection(mut stream: TcpStream, storage: ArcStorage) -> Option
     }
 }
 
-async fn handle_command(mut stream: &mut TcpStream, command_name: &str, command_params: &[Vec<u8>], storage: &LockStorage) -> bool {
+async fn handle_command(mut stream: &mut TcpStream, command_name: &str, command_params: &[Vec<u8>], storage: &Storage) -> bool {
     match command_name {
         "PING" => handle_ping(&mut stream).await,
         "ECHO" => handle_echo(&mut stream, command_params).await,
@@ -96,34 +93,62 @@ async fn handle_echo(stream: &mut TcpStream, params: &[Vec<u8>]) -> bool {
     write_binary_string(stream, &params[0]).await
 }
 
-async fn handle_get(stream: &mut TcpStream, params: &[Vec<u8>], storage: &LockStorage) -> bool {
+async fn handle_get(stream: &mut TcpStream, params: &[Vec<u8>], storage: &Storage) -> bool {
     if params.len() < 1 {
         eprintln!("get command is missing arguments");
         return true;
     }
-    let result = do_get(storage, &params[0]);
-    match result {
-        Some(value) => write_binary_string(stream, &value).await,
-        None => write_null(stream).await,
-    }
+    let result = storage.get(&params[0]);
+    write_binary_string_or_null(stream, result).await
 }
 
-fn do_get(storage: &LockStorage, key: &Vec<u8>) -> Option<Vec<u8>> {
-    storage.read().expect("got poisoned lock, can't handle that")
-        .get(key).map(|x| x.clone())
-}
-
-async fn handle_set(stream: &mut TcpStream, params: &[Vec<u8>], storage: &LockStorage) -> bool {
+async fn handle_set(stream: &mut TcpStream, params: &[Vec<u8>], storage: &Storage) -> bool {
     if params.len() < 2 {
         eprintln!("get command is missing arguments");
         return true;
     }
-    do_set(storage, params[0].clone(), params[1].clone());
+    let (key, params) = params.split_first().unwrap();
+    let (value, params) = params.split_first().unwrap();
+    let Some(expires_at) = get_expiry(params) else {
+        return false;
+    };
+    let item = StorageItem {
+        value: value.clone(),
+        expires_at,
+    };
+    storage.set(key.clone(), item);
     write_simple_string(stream, "OK").await
 }
 
-fn do_set(storage: &LockStorage, key: Vec<u8>, value: Vec<u8>) {
-    storage.write().expect("got poisoned lock, can't handle that")
-        .insert(key, value);
+fn get_expiry(params: &[Vec<u8>]) -> Option<Option<Instant>> {
+    if params.len() == 0 {
+        return Some(None);
+    }
+    let expiry_index = params.iter().position(|x| x.to_ascii_lowercase() == b"px");
+    let Some(expiry_index) = expiry_index else {
+        return Some(None);
+    };
+    let expiry_value = match params.get(expiry_index + 1) {
+        Some(x) => x,
+        None => {
+            eprintln!("No value found for the expiry param");
+            return None;
+        }
+    };
+    let expiry_value = match std::str::from_utf8(expiry_value) {
+        Ok(x) => x,
+        Err(err) => {
+            eprintln!("Expiry value is not a valid string {err}");
+            return None;
+        }
+    };
+    let expiry_value = match expiry_value.parse() {
+        Ok(x) => x,
+        Err(err) => {
+            eprintln!("Expiry value is not a valid number {err}");
+            return None;
+        }
+    };
+    let expires_at = Instant::now() + Duration::from_millis(expiry_value);
+    Some(Some(expires_at))
 }
-

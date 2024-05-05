@@ -82,7 +82,8 @@ async fn read_binary_string_body(reader: &mut (impl AsyncBufReadExt + Unpin), ex
     Some(result)
 }
 
-pub(crate) async fn write_simple_string(stream: &mut (impl AsyncWriteExt + Unpin), string: &str) -> bool {
+pub(crate) async fn write_simple_string(stream: &mut (impl AsyncWriteExt + Unpin), string: impl AsRef<str>) -> bool {
+    let string = string.as_ref();
     let result = stream.write_all(format!("+{string}{DELIMITER_STR}").as_bytes()).await;
     if let Err(error) = result {
         eprintln!("failed to write simple string: {error}");
@@ -91,7 +92,15 @@ pub(crate) async fn write_simple_string(stream: &mut (impl AsyncWriteExt + Unpin
     true
 }
 
-pub(crate) async fn write_binary_string(stream: &mut (impl AsyncWriteExt + Unpin), string: &[u8]) -> bool {
+pub(crate) async fn write_binary_string_or_null(stream: &mut (impl AsyncWriteExt + Unpin), string: Option<impl AsRef<[u8]>>) -> bool {
+    match string {
+        Some(value) => write_binary_string(stream, &value).await,
+        None => write_null(stream).await,
+    }
+}
+
+pub(crate) async fn write_binary_string(stream: &mut (impl AsyncWriteExt + Unpin), string: impl AsRef<[u8]>) -> bool {
+    let string = string.as_ref();
     let result = stream.write_all(format!("${}{DELIMITER_STR}", string.len()).as_bytes()).await;
     if let Err(error) = result {
         eprintln!("failed to write binary string size: {error}");
