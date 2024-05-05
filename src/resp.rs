@@ -30,24 +30,18 @@ async fn read_int(reader: &mut (impl AsyncBufReadExt + Unpin), expected_type_pre
         // EOF
         return None;
     }
-    if buf.len() < expected_type_prefix.len() + DELIMITER_STR.len() + 1 {
-        eprintln!("invalid format, integer line is too small, len {}, val {buf}", buf.len());
+    let Some(buf) = buf.strip_prefix(expected_type_prefix) else {
+        eprintln!("invalid format, did not find prefix {expected_type_prefix} in {buf}");
         return None;
-    }
-    let (data_type, tail) = buf.split_at(expected_type_prefix.len());
-    if data_type != expected_type_prefix {
-        eprintln!("invalid format, expected type {expected_type_prefix}, got {data_type}");
+    };
+    let Some(buf) = buf.strip_suffix(DELIMITER_STR) else {
+        eprintln!("invalid format, delimiter is missing or string is too large {buf}");
         return None;
-    }
-    let (size_string, delimiter) = tail.split_at(tail.len() - DELIMITER_STR.len());
-    if delimiter != DELIMITER_STR {
-        eprintln!("invalid format, integer string is too large {buf}");
-        return None;
-    }
-    let int = match size_string.parse() {
+    };
+    let int = match buf.parse() {
         Ok(x) => x,
         Err(err) => {
-            eprintln!("failed to parse integer from {size_string}: {err}");
+            eprintln!("failed to parse integer from {buf}: {err}");
             return None;
         }
     };
@@ -80,6 +74,28 @@ async fn read_binary_string_body(reader: &mut (impl AsyncBufReadExt + Unpin), ex
     }
     result.truncate(result.len() - DELIMITER_BYTES.len());
     Some(result)
+}
+
+pub(crate) async fn read_simple_string(reader: &mut (impl AsyncBufReadExt + Unpin), max_size: u64) -> Option<String> {
+    let mut buf = String::new();
+    let result = reader.take(max_size).read_line(&mut buf).await;
+    if let Err(error) = result {
+        eprintln!("Failed to read simple string {error}");
+        return None;
+    }
+    if buf.len() == 0 {
+        eprintln!("Got EOF when reading a simple string");
+        return None;
+    }
+    let Some(buf) = buf.strip_prefix('+') else {
+        eprintln!("Missing the simple string prefix");
+        return None;
+    };
+    let Some(buf) = buf.strip_suffix(DELIMITER_STR) else {
+        eprintln!("Missing the delimiter for simple string");
+        return None;
+    };
+    Some(buf.to_string())
 }
 
 pub(crate) async fn write_simple_string(stream: &mut (impl AsyncWriteExt + Unpin), string: impl AsRef<str>) -> Option<()> {

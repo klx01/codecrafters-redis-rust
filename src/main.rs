@@ -1,17 +1,18 @@
 use std::future::Future;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use clap::Parser;
-use tokio::io::{AsyncReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::net::{lookup_host, TcpListener, TcpStream};
 use tokio::time::error::Elapsed;
 use tokio::time::timeout;
+use crate::handshake::master_handshake;
 use crate::resp::*;
 use crate::storage::*;
 
 mod resp;
 mod storage;
+mod handshake;
 
 #[derive(Parser)]
 struct Cli {
@@ -38,7 +39,9 @@ async fn main() {
             .expect(format!("Failed to lookup the address of master host {master_addr}").as_str())
             .next()
             .expect(format!("No addresses found for master host {master_addr}").as_str());
-        master_handshake(&master_socket, port).await;
+        let mut master_stream = TcpStream::connect(master_socket).await
+            .expect("failed to connect to master");
+        master_handshake(&mut master_stream, port).await;
         true
     }  else {
         false
@@ -63,44 +66,6 @@ async fn main() {
         tokio::spawn(async move {
             handle_connection(stream, storage, info).await
         });
-    }
-}
-
-async fn master_handshake(master_socket: &SocketAddr, port: u16) {
-    let stream = &mut TcpStream::connect(master_socket).await
-        .expect("failed to connect to master");
-
-    let buf = &mut [0u8; 512];
-
-    handshake_write(stream, ["PING"]).await;
-    handshake_read(stream, buf, "+PONG\r\n").await;
-    handshake_write(stream, ["REPLCONF", "listening-port", port.to_string().as_str()]).await;
-    handshake_read(stream, buf, "+OK\r\n").await;
-    handshake_write(stream, ["REPLCONF", "capa", "psync2"]).await;
-    handshake_read(stream, buf, "+OK\r\n").await;
-}
-
-async fn handshake_write<S: AsRef<[u8]>>(stream: &mut TcpStream, message: impl AsRef<[S]>) {
-    exec_with_timeout(write_array_of_strings(stream, message))
-        .await
-        .expect("timeout when writing during handshake with master")
-        .expect("failed to write message during handshake with master");
-}
-
-async fn handshake_read(stream: &mut TcpStream, buf: &mut [u8], expected: &str) {
-    let read_size = exec_with_timeout(stream.read(buf))
-        .await
-        .expect("timeout when reading during handshake")
-        .expect("failed to read message during handshake");
-    if read_size == 0 {
-        panic!("got EOF from master during handshake");
-    }
-    let response = &buf[..read_size];
-    if response != expected.as_bytes() {
-        panic!(
-            "unexpected response from master: expected {expected}, got {:?}",
-            std::str::from_utf8(response)
-        );
     }
 }
 
