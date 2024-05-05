@@ -1,8 +1,11 @@
+use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use clap::Parser;
-use tokio::io::BufReader;
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::net::{lookup_host, TcpListener, TcpStream};
+use tokio::time::error::Elapsed;
 use tokio::time::timeout;
 use crate::resp::*;
 use crate::storage::*;
@@ -30,10 +33,11 @@ async fn main() {
 
     let is_slave = if cli.replicaof.len() > 0 {
         let master_addr = format!("{}:{}", cli.replicaof[0], cli.replicaof[1]);
-        let _master_socket = lookup_host(&master_addr).await
+        let master_socket = lookup_host(&master_addr).await
             .expect(format!("Failed to lookup the address of master host {master_addr}").as_str())
             .next()
             .expect(format!("No addresses found for master host {master_addr}").as_str());
+        master_handshake(&master_socket).await;
         true
     }  else {
         false
@@ -62,10 +66,35 @@ async fn main() {
     }
 }
 
+async fn master_handshake(master_socket: &SocketAddr) {
+    let mut master_stream = TcpStream::connect(master_socket).await
+        .expect("failed to connect to master");
+    exec_with_timeout(write_array_of_strings(&mut master_stream, ["PING"]))
+        .await
+        .expect("handshake ping timed out")
+        .expect("failed to write handshake ping");
+
+    let mut buf = [0u8; 512];
+    let read_size = exec_with_timeout(master_stream.read(&mut buf))
+        .await
+        .expect("handshake ping response timed out")
+        .expect("failed to read master's response to ping");
+    if read_size == 0 {
+        panic!("master did not respond to ping");
+    }
+    let response = &buf[..read_size];
+    if response != b"+PONG\r\n" {
+        panic!("unexpected response from master {:?}", std::str::from_utf8(response));
+    }
+}
+
+async fn exec_with_timeout<R>(future: impl Future<Output = R>) -> Result<R, Elapsed> {
+    timeout(Duration::from_millis(1000), future).await
+}
+
 async fn handle_connection(mut stream: TcpStream, storage: Arc<Storage>, info: Arc<Info>) -> Option<()> {
     loop {
-        let command = timeout(
-            Duration::from_millis(1000),
+        let command = exec_with_timeout(
             read_command(&mut BufReader::new(&mut stream))
         ).await;
         let command = match command {
@@ -89,13 +118,11 @@ async fn handle_connection(mut stream: TcpStream, storage: Arc<Storage>, info: A
         };
         let command_name = command_name.to_ascii_uppercase();
 
-        let can_continue = timeout(
-            Duration::from_millis(1000),
+        let write_result = exec_with_timeout(
             handle_command(&mut stream, &command_name, command_params, &storage, &info)
         ).await;
-        match can_continue {
-            Ok(true) => {},
-            Ok(false) => return None,
+        match write_result {
+            Ok(x) => x?,
             Err(_) => {
                 eprintln!("response timed out");
                 return None;
@@ -104,7 +131,7 @@ async fn handle_connection(mut stream: TcpStream, storage: Arc<Storage>, info: A
     }
 }
 
-async fn handle_command(stream: &mut TcpStream, command_name: &str, command_params: &[Vec<u8>], storage: &Storage, info: &Info) -> bool {
+async fn handle_command(stream: &mut TcpStream, command_name: &str, command_params: &[Vec<u8>], storage: &Storage, info: &Info) -> Option<()> {
     match command_name {
         "PING" => handle_ping(stream).await,
         "ECHO" => handle_echo(stream, command_params).await,
@@ -113,45 +140,42 @@ async fn handle_command(stream: &mut TcpStream, command_name: &str, command_para
         "INFO" => handle_info(stream, command_params, info, storage).await,
         _ => {
             eprintln!("received unknown command {command_name}");
-            true
+            Some(())
         },
     }
 }
 
-async fn handle_ping(stream: &mut TcpStream) -> bool {
+async fn handle_ping(stream: &mut TcpStream) -> Option<()> {
     write_simple_string(stream, "PONG").await
 }
 
-async fn handle_echo(stream: &mut TcpStream, params: &[Vec<u8>]) -> bool {
+async fn handle_echo(stream: &mut TcpStream, params: &[Vec<u8>]) -> Option<()> {
     if params.len() < 1 {
         eprintln!("echo command is missing arguments");
-        return true;
+        return Some(());
     }
     write_binary_string(stream, &params[0]).await
 }
 
-async fn handle_get(stream: &mut TcpStream, params: &[Vec<u8>], storage: &Storage) -> bool {
+async fn handle_get(stream: &mut TcpStream, params: &[Vec<u8>], storage: &Storage) -> Option<()> {
     if params.len() < 1 {
         eprintln!("get command is missing arguments");
-        return true;
+        return Some(());
     }
     let result = storage.get(&params[0]);
     write_binary_string_or_null(stream, result).await
 }
 
-async fn handle_set(stream: &mut TcpStream, params: &[Vec<u8>], storage: &Storage) -> bool {
+async fn handle_set(stream: &mut TcpStream, params: &[Vec<u8>], storage: &Storage) -> Option<()> {
     if params.len() < 2 {
         eprintln!("get command is missing arguments");
-        return true;
+        return Some(());
     }
     let (key, params) = params.split_first().unwrap();
     let (value, params) = params.split_first().unwrap();
-    let Some(expires_at) = get_expiry(params) else {
-        return false;
-    };
     let item = StorageItem {
         value: value.clone(),
-        expires_at,
+        expires_at: get_expiry(params)?,
     };
     storage.set(key.clone(), item);
     write_simple_string(stream, "OK").await
@@ -190,23 +214,20 @@ fn get_expiry(params: &[Vec<u8>]) -> Option<Option<Instant>> {
     Some(Some(expires_at))
 }
 
-async fn handle_info(stream: &mut TcpStream, params: &[Vec<u8>], info: &Info, _storage: &Storage) -> bool {
+async fn handle_info(stream: &mut TcpStream, params: &[Vec<u8>], info: &Info, _storage: &Storage) -> Option<()> {
     for section in params {
-        let can_continue = match section.as_slice() {
+        match section.as_slice() {
             b"replication" => info_replication(stream, info).await,
             _ => {
                 eprintln!("Unknown section {:?}", std::str::from_utf8(section));
-                true
+                Some(())
             }
-        };
-        if !can_continue {
-            return false;
-        }
+        }?;
     }
-    true
+    Some(())
 }
 
-async fn info_replication(stream: &mut TcpStream, info: &Info) -> bool {
+async fn info_replication(stream: &mut TcpStream, info: &Info) -> Option<()> {
     let result = format!(
 "# Replication
 role:{}
