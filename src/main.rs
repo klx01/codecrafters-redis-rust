@@ -66,7 +66,7 @@ async fn main() {
         let (tx, _) = channel(100);
         Some(tx)
     };
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (_shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     if let Some(master_stream) = master_stream {
         let storage = Arc::clone(&storage);
@@ -74,7 +74,7 @@ async fn main() {
         tokio::spawn(async move {
             handle_connection(master_stream, storage, info, None, HandlingMode::ServerSlaveConnectionMaster).await;
             eprintln!("lost connection to master, shutting down");
-            let _ = shutdown_tx.send(());
+            //let _ = shutdown_tx.send(());
         });
     }
 
