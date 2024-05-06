@@ -40,8 +40,9 @@ async fn main() {
             .expect(format!("Failed to lookup the address of master host {master_addr}").as_str())
             .next()
             .expect(format!("No addresses found for master host {master_addr}").as_str());
-        let mut master_stream = TcpStream::connect(master_socket).await
+        let master_stream = TcpStream::connect(master_socket).await
             .expect("failed to connect to master");
+        let mut master_stream = BufReader::new(master_stream); 
         master_handshake(&mut master_stream, port).await;
         Some(master_stream)
     }  else {
@@ -95,15 +96,14 @@ async fn main() {
                 let info = Arc::clone(&info);
                 let replication_tx = replication_tx.clone();
                 tokio::spawn(async move {
-                    handle_connection(stream, storage, info, replication_tx, mode).await
+                    handle_connection(BufReader::new(stream), storage, info, replication_tx, mode).await
                 });
             },
         }
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, storage: Arc<Storage>, info: Arc<ServerInfo>, repl_transmitter: Option<Sender<Command>>, mode: HandlingMode) -> Option<()> {
-    let mut stream = BufReader::new(&mut stream);
+async fn handle_connection(mut stream: impl AsyncBufReadExt + AsyncWriteExt + Unpin, storage: Arc<Storage>, info: Arc<ServerInfo>, repl_transmitter: Option<Sender<Command>>, mode: HandlingMode) -> Option<()> {
     let mut repl_receiver = loop {
         /*
         None is returned if there were any errors in the message format.
@@ -142,12 +142,12 @@ async fn handle_connection(mut stream: TcpStream, storage: Arc<Storage>, info: A
     };
     drop(repl_transmitter);
     //println!("Slave is connected");
-    let res = handle_slave_connection(&mut stream, storage, info, &mut repl_receiver).await;
+    let res = handle_slave_connection(stream, storage, info, &mut repl_receiver).await;
     //println!("Slave is disconnected");
     res
 }
 
-async fn handle_slave_connection(mut stream: (impl AsyncBufReadExt + AsyncWriteExt + Unpin), storage: Arc<Storage>, info: Arc<ServerInfo>, repl_receiver: &mut Receiver<Command>) -> Option<()> {
+async fn handle_slave_connection(mut stream: impl AsyncBufReadExt + AsyncWriteExt + Unpin, storage: Arc<Storage>, info: Arc<ServerInfo>, repl_receiver: &mut Receiver<Command>) -> Option<()> {
     loop {
         let mut reader = BufReader::new(&mut stream);
         select! {

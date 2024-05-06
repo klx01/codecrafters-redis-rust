@@ -1,7 +1,8 @@
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use crate::ServerInfo;
-use crate::resp::{Command, exec_with_timeout, write_binary_string, write_binary_string_or_null, write_simple_string};
+use crate::resp::*;
 use crate::storage::{Storage, StorageItem};
 
 const EMPTY_RDB_FILE_HEX: &str = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
@@ -69,15 +70,20 @@ async fn set(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], stor
         eprintln!("set command was called for slave by non-master");
         return Some(());
     }
-    if params.len() < 2 {
-        eprintln!("set command is missing arguments");
+    let Some((key, params)) = params.split_first() else {
+        eprintln!("set command is missing a key parameter");
         return Some(());
-    }
-    let (key, params) = params.split_first().unwrap();
-    let (value, params) = params.split_first().unwrap();
+    };
+    let Some((value, params)) = params.split_first() else {
+        eprintln!("set command is missing a value parameter");
+        return Some(());
+    };
+    let Some(expiry) = parse_expiry(params) else {
+        return Some(());
+    };
     let item = StorageItem {
         value: value.clone(),
-        expires_at: parse_expiry(params)?,
+        expires_at: expiry,
     };
     storage.set(key.clone(), item);
     if server_info.is_slave {
@@ -102,20 +108,7 @@ fn parse_expiry(params: &[Vec<u8>]) -> Option<Option<Instant>> {
             return None;
         }
     };
-    let expiry_value = match std::str::from_utf8(expiry_value) {
-        Ok(x) => x,
-        Err(err) => {
-            eprintln!("Expiry value is not a valid string {err}");
-            return None;
-        }
-    };
-    let expiry_value = match expiry_value.parse() {
-        Ok(x) => x,
-        Err(err) => {
-            eprintln!("Expiry value is not a valid number {err}");
-            return None;
-        }
-    };
+    let expiry_value = parse_value(expiry_value)?;
     let expires_at = Instant::now() + Duration::from_millis(expiry_value);
     Some(Some(expires_at))
 }
@@ -148,44 +141,64 @@ master_repl_offset:{}
 }
 
 async fn repl_conf(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], info: &ServerInfo) -> Option<()> {
-    if info.is_slave {
-        eprintln!("received psync command as a slave");
+    let Some((subcommand, params)) = split_and_parse_str(params) else {
         return Some(());
-    }
-    if params.len() < 2 {
-        eprintln!("replconf command is missing arguments");
-        return Some(());
-    }
-    match params[0].as_slice() {
-        b"capa" => if params[1].as_slice() == b"psync2" {
-            write_simple_string(stream, "OK").await
-        } else {
-            eprintln!("unexpected replconf capabilities");
-            Some(())
-        },
-        b"listening-port" => {
-            let port = match std::str::from_utf8(&params[1]) {
-                Ok(x) => x,
-                Err(error) => {
-                    eprintln!("slave port is not a valid string {error}");
-                    return Some(());
-                }
-            };
-            match port.parse::<u16>() {
-                Ok(_) => {
-                    write_simple_string(stream, "OK").await
-                },
-                Err(error) => {
-                    eprintln!("slave port is not a valid int {error}");
-                    Some(())
-                }
-            }
-        }
+    };
+    let subcommand = subcommand.to_ascii_uppercase();
+    match subcommand.as_str() {
+        "CAPA" => repl_conf_capa(stream, params, info).await,
+        "LISTENING-PORT" => repl_conf_port(stream, params, info).await,
+        "GETACK" => repl_conf_get_ack(stream, params, info).await,
+        "ACK" => repl_conf_ack(stream, params, info).await,
         _ => {
-            eprintln!("unexpected replconf argument");
+            eprintln!("unknown replconf subcommand {subcommand}");
             return Some(());
         }
     }
+}
+
+async fn repl_conf_capa(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], info: &ServerInfo) -> Option<()> {
+    if info.is_slave {
+        eprintln!("received replconf capa as a slave");
+        return Some(());
+    }
+    let Some(_) = split_and_assert_value(params, b"psync2") else {
+        return Some(());
+    };
+    write_simple_string(stream, "OK").await
+}
+
+async fn repl_conf_port(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], info: &ServerInfo) -> Option<()> {
+    if info.is_slave {
+        eprintln!("received replconf listening-port as a slave");
+        return Some(());
+    }
+    let Some(_) = split_and_parse_value::<u16>(params) else {
+        return Some(());
+    };
+    write_simple_string(stream, "OK").await
+}
+
+async fn repl_conf_get_ack(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], info: &ServerInfo) -> Option<()> {
+    if !info.is_slave {
+        eprintln!("received replconf getack as master");
+        return Some(());
+    }
+    let Some(_) = split_and_assert_value(params, b"*") else {
+        return Some(());
+    };
+    write_array_of_strings(stream, ["REPLCONF", "ACK", "0"]).await
+}
+
+async fn repl_conf_ack(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], info: &ServerInfo) -> Option<()> {
+    if info.is_slave {
+        eprintln!("received replconf getack as a slave");
+        return Some(());
+    }
+    let Some(_) = split_and_parse_value::<usize>(params) else {
+        return Some(());
+    };
+    write_array_of_strings(stream, ["REPLCONF", "ACK", "0"]).await
 }
 
 async fn psync(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], info: &ServerInfo) -> Option<()> {
@@ -193,19 +206,64 @@ async fn psync(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], in
         eprintln!("received psync command as a slave");
         return Some(());
     }
-    if params.len() < 2 {
-        eprintln!("psync command is missing arguments");
+    let Some(params) = split_and_assert_value(params, b"?") else {
         return Some(());
-    }
-    if params[0].as_slice() != b"?"{
-        eprintln!("unexpected psync id argument");
+    };
+    let Some(_) = split_and_assert_value(params, b"-1") else {
         return Some(());
-    }
-    if params[1].as_slice() != b"-1"{
-        eprintln!("unexpected psync offset argument");
-        return Some(());
-    }
+    };
     write_simple_string(stream, format!("FULLRESYNC {} 0", info.replication_id)).await?;
     let file_contents = hex::decode(EMPTY_RDB_FILE_HEX).unwrap();
     write_binary_string(stream, file_contents, false).await
+}
+
+fn split_and_parse_value<T: FromStr>(params: &[Vec<u8>]) -> Option<(T, &[Vec<u8>])> {
+    let Some((value, params)) = params.split_first() else {
+        eprintln!("missing parameter");
+        return None;
+    };
+    let val = parse_value(value)?;
+    Some((val, params))
+}
+
+fn split_and_parse_str(params: &[Vec<u8>]) -> Option<(&str, &[Vec<u8>])> {
+    let Some((value, params)) = params.split_first() else {
+        eprintln!("missing parameter");
+        return None;
+    };
+    let val = parse_str(value)?;
+    Some((val, params))
+}
+
+fn split_and_assert_value<'a>(params: &'a [Vec<u8>], expected: &[u8]) -> Option<&'a [Vec<u8>]> {
+    let Some((value, params)) = params.split_first() else {
+        eprintln!("missing parameter");
+        return None;
+    };
+    if value != expected {
+        eprintln!("unexpected parameter value");
+        return None;
+    }
+    Some(params)
+}
+
+fn parse_value<T: FromStr>(value: &[u8]) -> Option<T> {
+    let value = parse_str(value)?;
+    match value.parse::<T>() {
+        Ok(x) => Some(x),
+        Err(_) => {
+            eprintln!("value is not valid: {value}");
+            None
+        }
+    }
+}
+
+fn parse_str(value: &[u8]) -> Option<&str> {
+    match std::str::from_utf8(value) {
+        Ok(x) => Some(x),
+        Err(error) => {
+            eprintln!("value is not a valid string {error}");
+            return None;
+        }
+    }
 }

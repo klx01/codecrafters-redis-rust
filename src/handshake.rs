@@ -1,8 +1,7 @@
-use tokio::io::{AsyncReadExt, BufReader};
-use tokio::net::TcpStream;
-use crate::resp::{exec_with_timeout, read_binary_string, read_simple_string, write_array_of_strings};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use crate::resp::*;
 
-pub(crate) async fn master_handshake(stream: &mut TcpStream, my_port: u16) -> (String, usize) {
+pub(crate) async fn master_handshake(stream: &mut (impl AsyncBufReadExt + AsyncWriteExt + Unpin), my_port: u16) -> (String, usize) {
     let buf = &mut [0u8; 512];
     write(stream, ["PING"]).await;
     read_expect(stream, buf, "+PONG\r\n").await;
@@ -11,27 +10,26 @@ pub(crate) async fn master_handshake(stream: &mut TcpStream, my_port: u16) -> (S
     write(stream, ["REPLCONF", "capa", "psync2"]).await;
     read_expect(stream, buf, "+OK\r\n").await;
     write(stream, ["PSYNC", "?", "-1"]).await;
-    let mut reader = BufReader::new(stream);
-    let master_config = exec_with_timeout(read_simple_string(&mut reader, 100))
+    let master_config = exec_with_timeout(read_simple_string(stream, 100))
         .await
         .expect("timeout when reading config during handshake")
         .unwrap();
     let result = parse_master_config(&master_config);
-    exec_with_timeout(read_binary_string(&mut reader, false))
+    exec_with_timeout(read_binary_string(stream, false))
         .await
         .expect("timeout when reading RDB file during handshake")
         .unwrap();
     result
 }
 
-async fn write<S: AsRef<[u8]>>(stream: &mut TcpStream, message: impl AsRef<[S]>) {
+async fn write<S: AsRef<[u8]>>(stream: &mut (impl AsyncWriteExt + Unpin), message: impl AsRef<[S]>) {
     exec_with_timeout(write_array_of_strings(stream, message))
         .await
         .expect("timeout when writing during handshake with master")
         .expect("failed to write message during handshake with master");
 }
 
-async fn read<'a>(stream: &mut TcpStream, buf: &'a mut [u8]) -> &'a [u8] {
+async fn read<'a>(stream: &mut (impl AsyncBufReadExt + Unpin), buf: &'a mut [u8]) -> &'a [u8] {
     let read_size = exec_with_timeout(stream.read(buf))
         .await
         .expect("timeout when reading during handshake")
@@ -42,7 +40,7 @@ async fn read<'a>(stream: &mut TcpStream, buf: &'a mut [u8]) -> &'a [u8] {
     &buf[..read_size]
 }
 
-async fn read_expect(stream: &mut TcpStream, buf: &mut [u8], expected: &str) {
+async fn read_expect(stream: &mut (impl AsyncBufReadExt + Unpin), buf: &mut [u8], expected: &str) {
     let response = read(stream, buf).await;
     if response != expected.as_bytes() {
         panic!(
