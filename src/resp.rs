@@ -4,10 +4,12 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::time::error::Elapsed;
 use tokio::time::timeout;
 
+pub(crate) type Command = (String, Vec<Vec<u8>>);
+
 const DELIMITER_STR: &str = "\r\n";
 const DELIMITER_BYTES: &[u8] = DELIMITER_STR.as_bytes();
 
-pub(crate) async fn read_command(reader: &mut (impl AsyncBufReadExt + Unpin)) -> Option<Vec<Vec<u8>>> {
+pub(crate) async fn read_command(reader: &mut (impl AsyncBufReadExt + Unpin)) -> Option<Option<Command>> {
     /*
     Only the very first read does not have a timeout.
     Because we are reading only a very small amounts of data,
@@ -16,14 +18,28 @@ pub(crate) async fn read_command(reader: &mut (impl AsyncBufReadExt + Unpin)) ->
     and because pauses there are not expected.
      */
     let array_size = read_command_array_size(reader).await?;
-    let command = exec_with_timeout(async move {
-        let mut command = Vec::with_capacity(array_size);
-        for _ in 0..array_size {
-            command.push(read_binary_string(reader, true).await?)
+    if array_size == 0 {
+        eprintln!("received a command of size 0");
+        return Some(None);
+    }
+
+    let result = exec_with_timeout(async move {
+        let command_name = read_binary_string(reader, true).await?;
+        let mut command_params = Vec::with_capacity(array_size);
+        for _ in 1..array_size {
+            command_params.push(read_binary_string(reader, true).await?)
         }
-        Some(command)
+        let mut command_name = match String::from_utf8(command_name) {
+            Ok(x) => x,
+            Err(error) => {
+                eprintln!("failed to parse the received command name: {error}");
+                return Some(None);
+            }
+        };
+        command_name.make_ascii_uppercase();
+        Some(Some((command_name, command_params)))
     }).await;
-    match command {
+    match result {
         Ok(x) => x,
         Err(_) => {
             eprintln!("read timed out");
@@ -97,7 +113,7 @@ async fn read_binary_string_body(reader: &mut (impl AsyncBufReadExt + Unpin), ex
             eprintln!("invalid format, string is missing the delimiter");
             return None;
         }
-        result.truncate(result.len() - DELIMITER_BYTES.len());   
+        result.truncate(result.len() - DELIMITER_BYTES.len());
     }
     Some(result)
 }
@@ -158,7 +174,7 @@ pub(crate) async fn write_binary_string(stream: &mut (impl AsyncWriteExt + Unpin
         if let Err(error) = result {
             eprintln!("failed to write binary string delimiter: {error}");
             return None;
-        }   
+        }
     }
     Some(())
 }
@@ -183,6 +199,13 @@ pub(crate) async fn write_array_of_strings<S: AsRef<[u8]>>(stream: &mut (impl As
         write_binary_string(stream, string, true).await?;
     }
     Some(())
+}
+
+pub(crate) async fn write_command(stream: &mut (impl AsyncWriteExt + Unpin), (name, mut params): Command) -> Option<()> {
+    let mut vec = vec![];
+    vec.push(name.into_bytes());
+    vec.append(&mut params);
+    write_array_of_strings(stream, vec).await
 }
 
 pub(crate) async fn exec_with_timeout<R>(future: impl Future<Output = R>) -> Result<R, Elapsed> {

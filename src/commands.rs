@@ -1,27 +1,22 @@
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
+use tokio::io::AsyncWriteExt;
 use crate::ServerInfo;
-use crate::resp::{exec_with_timeout, write_binary_string, write_binary_string_or_null, write_simple_string};
+use crate::resp::{Command, exec_with_timeout, write_binary_string, write_binary_string_or_null, write_simple_string};
 use crate::storage::{Storage, StorageItem};
 
 const EMPTY_RDB_FILE_HEX: &str = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
 
-pub(crate) async fn handle_command(stream: &mut TcpStream, command: &[Vec<u8>], storage: &Storage, server_info: &ServerInfo, is_connection_with_master: bool) -> Option<()> {
-    if command.len() == 0 {
-        eprintln!("received a command of size 0");
-        return Some(());
-    }
-    let (command_name, command_params) = command.split_first().unwrap();
-    let command_name = match std::str::from_utf8(command_name) {
-        Ok(x) => x,
-        Err(error) => {
-            eprintln!("failed to parse the received command name: {error}");
-            return Some(());
-        }
-    };
-    let command_name = command_name.to_ascii_uppercase();
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) enum HandlingMode {
+    ServerMasterConnectionExternal,
+    ServerMasterConnectionSlave,
+    ServerSlaveConnectionExternal,
+    ServerSlaveConnectionMaster,
+}
+
+pub(crate) async fn handle_command(stream: &mut (impl AsyncWriteExt + Unpin), command: &Command, storage: &Storage, server_info: &ServerInfo, mode: HandlingMode) -> Option<()> {
     let write_result = exec_with_timeout(
-        handle_command_inner(stream, &command_name, &command_params, &storage, &server_info, is_connection_with_master)
+        handle_command_inner(stream, &command, &storage, &server_info, mode)
     ).await;
     match write_result {
         Ok(x) => x,
@@ -32,15 +27,14 @@ pub(crate) async fn handle_command(stream: &mut TcpStream, command: &[Vec<u8>], 
     }
 }
 
-async fn handle_command_inner(stream: &mut TcpStream, command_name: &str, command_params: &[Vec<u8>], storage: &Storage, server_info: &ServerInfo, is_connection_with_master: bool) -> Option<()> {
-    let command_name = command_name.to_ascii_uppercase();
+async fn handle_command_inner(stream: &mut (impl AsyncWriteExt + Unpin), (command_name, command_params): &Command, storage: &Storage, server_info: &ServerInfo, mode: HandlingMode) -> Option<()> {
     match command_name.as_str() {
         "PING" => ping(stream).await,
         "ECHO" => echo(stream, command_params).await,
         "GET" => get(stream, command_params, storage).await,
-        "SET" => set(stream, command_params, storage, server_info, is_connection_with_master).await,
+        "SET" => set(stream, command_params, storage, server_info, mode).await,
         "INFO" => info(stream, command_params, server_info, storage).await,
-        "REPLCONF" => repl_conf(stream, command_params).await,
+        "REPLCONF" => repl_conf(stream, command_params, server_info).await,
         "PSYNC" => psync(stream, command_params, server_info).await,
         _ => {
             eprintln!("received unknown command {command_name}");
@@ -49,11 +43,11 @@ async fn handle_command_inner(stream: &mut TcpStream, command_name: &str, comman
     }
 }
 
-async fn ping(stream: &mut TcpStream) -> Option<()> {
+async fn ping(stream: &mut (impl AsyncWriteExt + Unpin)) -> Option<()> {
     write_simple_string(stream, "PONG").await
 }
 
-async fn echo(stream: &mut TcpStream, params: &[Vec<u8>]) -> Option<()> {
+async fn echo(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>]) -> Option<()> {
     if params.len() < 1 {
         eprintln!("echo command is missing arguments");
         return Some(());
@@ -61,7 +55,7 @@ async fn echo(stream: &mut TcpStream, params: &[Vec<u8>]) -> Option<()> {
     write_binary_string(stream, &params[0], true).await
 }
 
-async fn get(stream: &mut TcpStream, params: &[Vec<u8>], storage: &Storage) -> Option<()> {
+async fn get(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], storage: &Storage) -> Option<()> {
     if params.len() < 1 {
         eprintln!("get command is missing arguments");
         return Some(());
@@ -70,8 +64,8 @@ async fn get(stream: &mut TcpStream, params: &[Vec<u8>], storage: &Storage) -> O
     write_binary_string_or_null(stream, result).await
 }
 
-async fn set(stream: &mut TcpStream, params: &[Vec<u8>], storage: &Storage, server_info: &ServerInfo, is_connection_with_master: bool) -> Option<()> {
-    if server_info.is_slave && !is_connection_with_master {
+async fn set(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], storage: &Storage, server_info: &ServerInfo, mode: HandlingMode) -> Option<()> {
+    if server_info.is_slave && (mode != HandlingMode::ServerSlaveConnectionMaster) {
         eprintln!("set command was called for slave by non-master");
         return Some(());
     }
@@ -126,7 +120,7 @@ fn parse_expiry(params: &[Vec<u8>]) -> Option<Option<Instant>> {
     Some(Some(expires_at))
 }
 
-async fn info(stream: &mut TcpStream, params: &[Vec<u8>], info: &ServerInfo, _storage: &Storage) -> Option<()> {
+async fn info(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], info: &ServerInfo, _storage: &Storage) -> Option<()> {
     for section in params {
         match section.as_slice() {
             b"replication" => info_replication(stream, info).await,
@@ -139,7 +133,7 @@ async fn info(stream: &mut TcpStream, params: &[Vec<u8>], info: &ServerInfo, _st
     Some(())
 }
 
-async fn info_replication(stream: &mut TcpStream, info: &ServerInfo) -> Option<()> {
+async fn info_replication(stream: &mut (impl AsyncWriteExt + Unpin), info: &ServerInfo) -> Option<()> {
     let result = format!(
         "# Replication
 role:{}
@@ -153,7 +147,11 @@ master_repl_offset:{}
     write_binary_string(stream, result, true).await
 }
 
-async fn repl_conf(stream: &mut TcpStream, params: &[Vec<u8>]) -> Option<()> {
+async fn repl_conf(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], info: &ServerInfo) -> Option<()> {
+    if info.is_slave {
+        eprintln!("received psync command as a slave");
+        return Some(());
+    }
     if params.len() < 2 {
         eprintln!("replconf command is missing arguments");
         return Some(());
@@ -174,8 +172,8 @@ async fn repl_conf(stream: &mut TcpStream, params: &[Vec<u8>]) -> Option<()> {
                 }
             };
             match port.parse::<u16>() {
-                Ok(_) => { 
-                    write_simple_string(stream, "OK").await 
+                Ok(_) => {
+                    write_simple_string(stream, "OK").await
                 },
                 Err(error) => {
                     eprintln!("slave port is not a valid int {error}");
@@ -190,7 +188,11 @@ async fn repl_conf(stream: &mut TcpStream, params: &[Vec<u8>]) -> Option<()> {
     }
 }
 
-async fn psync(stream: &mut TcpStream, params: &[Vec<u8>], info: &ServerInfo) -> Option<()> {
+async fn psync(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], info: &ServerInfo) -> Option<()> {
+    if info.is_slave {
+        eprintln!("received psync command as a slave");
+        return Some(());
+    }
     if params.len() < 2 {
         eprintln!("psync command is missing arguments");
         return Some(());

@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use clap::Parser;
-use tokio::io::BufReader;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{lookup_host, TcpListener, TcpStream};
 use tokio::select;
-use tokio::sync::broadcast::{channel, Sender};
+use tokio::sync::broadcast::{channel, Receiver, Sender};
 use tokio::sync::broadcast::error::RecvError;
-use crate::commands::handle_command;
+use crate::commands::{handle_command, HandlingMode};
 use crate::handshake::master_handshake;
 use crate::resp::*;
 use crate::storage::*;
@@ -50,7 +50,7 @@ async fn main() {
 
     let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await
         .expect(format!("Failed to bind to the port {port}").as_str());
-    
+
     let is_slave = master_stream.is_some();
     let info = ServerInfo {
         is_slave,
@@ -66,28 +66,44 @@ async fn main() {
         let (tx, _) = channel(100);
         Some(tx)
     };
-    
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
     if let Some(master_stream) = master_stream {
         let storage = Arc::clone(&storage);
         let info = Arc::clone(&info);
         tokio::spawn(async move {
-            handle_connection(master_stream, storage, info, None, true).await
+            handle_connection(master_stream, storage, info, None, HandlingMode::ServerSlaveConnectionMaster).await;
+            eprintln!("lost connection to master, shutting down");
+            let _ = shutdown_tx.send(());
         });
     }
 
+    let mode = if is_slave {
+        HandlingMode::ServerSlaveConnectionExternal
+    } else {
+        HandlingMode::ServerMasterConnectionExternal
+    };
     loop {
-        let (stream, _addr) = listener.accept().await
-            .expect("Failed to accept connection");
-        let storage = Arc::clone(&storage);
-        let info = Arc::clone(&info);
-        let replication_tx = replication_tx.clone();
-        tokio::spawn(async move {
-            handle_connection(stream, storage, info, replication_tx, false).await
-        });
+        select! {
+            _ = &mut shutdown_rx => {
+                break;
+            },
+            accept_res = listener.accept() => {
+                let (stream, _addr) = accept_res
+                    .expect("Failed to accept connection");
+                let storage = Arc::clone(&storage);
+                let info = Arc::clone(&info);
+                let replication_tx = replication_tx.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, storage, info, replication_tx, mode).await
+                });
+            },
+        }
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, storage: Arc<Storage>, info: Arc<ServerInfo>, repl_transmitter: Option<Sender<Vec<Vec<u8>>>>, is_connection_with_master: bool) -> Option<()> {
+async fn handle_connection(mut stream: TcpStream, storage: Arc<Storage>, info: Arc<ServerInfo>, repl_transmitter: Option<Sender<Command>>, mode: HandlingMode) -> Option<()> {
+    let mut stream = BufReader::new(&mut stream);
     let mut repl_receiver = loop {
         /*
         None is returned if there were any errors in the message format.
@@ -96,23 +112,27 @@ async fn handle_connection(mut stream: TcpStream, storage: Arc<Storage>, info: A
         Format errors also include both read and write timeouts.
         Because that might mean that some data was lost.
          */
-        let command = read_command(&mut BufReader::new(&mut stream)).await?;
-        handle_command(&mut stream, &command, &storage, &info, is_connection_with_master).await?;
+        let command = read_command(&mut stream).await?;
+        let Some(command) = command else {
+            // todo: return error replies instead of just logging errors
+            continue;
+        };
+        handle_command(&mut stream, &command, &storage, &info, mode).await?;
         /*
         We are using broadcast channels for replication, because we want each slave to have their own queue of messages,
         so that slow slaves do not affect fast slaves;
-        Normal connections should have a transmitter side of the channel, while slave connections should have a receiver side of the channel.
+        For master server, normal connections should have a transmitter side of the channel, while slave connections should have a receiver side of the channel.
         We can't detect that a connection is a slave until the handshake is completed,
         so we start as a normal channel with a transmitter, and then convert to a slave with a receiver.
-        If the server is a slave, it does not have a replication transmitter.
+        If the server itself is a slave, it does not have a replication transmitter.
          */
         if let Some(repl_transmitter) = &repl_transmitter {
-            match command[0].as_slice() {
-                b"PSYNC" => {
-                    // ideally receiver should be created at the moment when the initial dump is created, so that all messages after the dump are queued  
+            match command.0.as_str() {
+                "PSYNC" => {
+                    // ideally receiver should be created at the moment when the initial dump is created, so that all messages after the dump are queued
                     break repl_transmitter.subscribe();
                 },
-                b"SET" => {
+                "SET" => {
                     // if we want to ensure the order of the messages, we should send this while we are still holding the write lock
                     let _ = repl_transmitter.send(command);
                 },
@@ -121,17 +141,28 @@ async fn handle_connection(mut stream: TcpStream, storage: Arc<Storage>, info: A
         }
     };
     drop(repl_transmitter);
+    //println!("Slave is connected");
+    let res = handle_slave_connection(&mut stream, storage, info, &mut repl_receiver).await;
+    //println!("Slave is disconnected");
+    res
+}
+
+async fn handle_slave_connection(mut stream: (impl AsyncBufReadExt + AsyncWriteExt + Unpin), storage: Arc<Storage>, info: Arc<ServerInfo>, repl_receiver: &mut Receiver<Command>) -> Option<()> {
     loop {
         let mut reader = BufReader::new(&mut stream);
         select! {
             command = read_command(&mut reader) => {
                 let command = command?;
-                handle_command(&mut stream, &command, &storage, &info, is_connection_with_master).await?;
+                if let Some(command) = command {
+                    handle_command(&mut stream, &command, &storage, &info, HandlingMode::ServerMasterConnectionSlave).await?;
+                } else {
+                    // todo: return error replies instead of just logging errors
+                };
             },
             replicated_command = repl_receiver.recv() => {
                 match replicated_command {
                     Ok(command) => {
-                        write_array_of_strings(&mut stream, command).await?;
+                        write_command(&mut stream, command).await?;
                     },
                     Err(RecvError::Lagged(_)) => {
                         // we have dropped some messages that should have been replicated, can't continue
