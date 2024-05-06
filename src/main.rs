@@ -104,6 +104,7 @@ async fn main() {
 }
 
 async fn handle_connection(mut stream: impl AsyncBufReadExt + AsyncWriteExt + Unpin, storage: Arc<Storage>, info: Arc<ServerInfo>, repl_transmitter: Option<Sender<Command>>, mode: HandlingMode) -> Option<()> {
+    let mut bytes_processed = 0usize;
     let mut repl_receiver = loop {
         /*
         None is returned if there were any errors in the message format.
@@ -112,12 +113,18 @@ async fn handle_connection(mut stream: impl AsyncBufReadExt + AsyncWriteExt + Un
         Format errors also include both read and write timeouts.
         Because that might mean that some data was lost.
          */
-        let command = read_command(&mut stream).await?;
+        let (command, command_bytes) = read_command(&mut stream).await?;
         let Some(command) = command else {
+            if mode == HandlingMode::ServerSlaveConnectionMaster {
+                bytes_processed += command_bytes;
+            }
             // todo: return error replies instead of just logging errors
             continue;
         };
-        handle_command(&mut stream, &command, &storage, &info, mode).await?;
+        handle_command(&mut stream, &command, &storage, &info, mode, bytes_processed).await?;
+        if mode == HandlingMode::ServerSlaveConnectionMaster {
+            bytes_processed += command_bytes;
+        }
         /*
         We are using broadcast channels for replication, because we want each slave to have their own queue of messages,
         so that slow slaves do not affect fast slaves;
@@ -152,9 +159,9 @@ async fn handle_slave_connection(mut stream: impl AsyncBufReadExt + AsyncWriteEx
         let mut reader = BufReader::new(&mut stream);
         select! {
             command = read_command(&mut reader) => {
-                let command = command?;
+                let (command, _) = command?;
                 if let Some(command) = command {
-                    handle_command(&mut stream, &command, &storage, &info, HandlingMode::ServerMasterConnectionSlave).await?;
+                    handle_command(&mut stream, &command, &storage, &info, HandlingMode::ServerMasterConnectionSlave, 0).await?;
                 } else {
                     // todo: return error replies instead of just logging errors
                 };

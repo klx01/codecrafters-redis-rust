@@ -9,7 +9,7 @@ pub(crate) type Command = (String, Vec<Vec<u8>>);
 const DELIMITER_STR: &str = "\r\n";
 const DELIMITER_BYTES: &[u8] = DELIMITER_STR.as_bytes();
 
-pub(crate) async fn read_command(reader: &mut (impl AsyncBufReadExt + Unpin)) -> Option<Option<Command>> {
+pub(crate) async fn read_command(reader: &mut (impl AsyncBufReadExt + Unpin)) -> Option<(Option<Command>, usize)> {
     /*
     Only the very first read does not have a timeout.
     Because we are reading only a very small amounts of data,
@@ -17,27 +17,31 @@ pub(crate) async fn read_command(reader: &mut (impl AsyncBufReadExt + Unpin)) ->
     Later reads have a timeout, to protect against clients that would make us allocate memory and hold it
     and because pauses there are not expected.
      */
-    let array_size = read_command_array_size(reader).await?;
+    let (array_size, mut read_bytes) = read_command_array_size(reader).await?;
     if array_size == 0 {
         eprintln!("received a command of size 0");
-        return Some(None);
+        return Some((None, read_bytes));
     }
 
     let result = exec_with_timeout(async move {
-        let command_name = read_binary_string(reader, true).await?;
+        let (command_name, name_bytes) = read_binary_string_with_size(reader, true).await?;
+        read_bytes += name_bytes;
         let mut command_params = Vec::with_capacity(array_size);
         for _ in 1..array_size {
-            command_params.push(read_binary_string(reader, true).await?)
+            let (param, param_bytes) = read_binary_string_with_size(reader, true).await?;
+            read_bytes += param_bytes;
+            command_params.push(param)
         }
         let mut command_name = match String::from_utf8(command_name) {
             Ok(x) => x,
             Err(error) => {
                 eprintln!("failed to parse the received command name: {error}");
-                return Some(None);
+                return Some((None, read_bytes));
             }
         };
         command_name.make_ascii_uppercase();
-        Some(Some((command_name, command_params)))
+        let command = (command_name, command_params); 
+        Some((Some(command), read_bytes))
     }).await;
     match result {
         Ok(x) => x,
@@ -48,18 +52,19 @@ pub(crate) async fn read_command(reader: &mut (impl AsyncBufReadExt + Unpin)) ->
     }
 }
 
-async fn read_command_array_size(reader: &mut (impl AsyncBufReadExt + Unpin)) -> Option<usize> {
+async fn read_command_array_size(reader: &mut (impl AsyncBufReadExt + Unpin)) -> Option<(usize, usize)> {
     return read_int(reader, "*", true, 100).await
 }
 
-async fn read_int(reader: &mut (impl AsyncBufReadExt + Unpin), expected_type_prefix: &'static str, is_eof_expected: bool, max: usize) -> Option<usize> {
+async fn read_int(reader: &mut (impl AsyncBufReadExt + Unpin), expected_type_prefix: &'static str, is_eof_expected: bool, max: usize) -> Option<(usize, usize)> {
     let mut buf = String::new();
     let res = reader.take(10).read_line(&mut buf).await;
     if let Err(err) = res {
         eprintln!("failed to read integer line {err}");
         return None;
     }
-    if buf.len() == 0 {
+    let read_bytes = buf.len();
+    if read_bytes == 0 {
         if !is_eof_expected {
             eprintln!("unexpected end of file when reading integer");
         }
@@ -85,19 +90,24 @@ async fn read_int(reader: &mut (impl AsyncBufReadExt + Unpin), expected_type_pre
         eprintln!("integer {int} larger than max allowed {max}");
         return None;
     }
-    Some(int)
+    Some((int, read_bytes))
 }
 
 pub(crate) async fn read_binary_string(reader: &mut (impl AsyncBufReadExt + Unpin), with_delimiter: bool) -> Option<Vec<u8>> {
-    let size = read_binary_string_size(reader).await?;
-    read_binary_string_body(reader, size, with_delimiter).await
+    read_binary_string_with_size(reader, with_delimiter).await.map(|x| x.0)
 }
 
-async fn read_binary_string_size(reader: &mut (impl AsyncBufReadExt + Unpin)) -> Option<usize> {
+async fn read_binary_string_with_size(reader: &mut (impl AsyncBufReadExt + Unpin), with_delimiter: bool) -> Option<(Vec<u8>, usize)> {
+    let (size, size_bytes) = read_binary_string_size(reader).await?;
+    let (string, string_bytes) = read_binary_string_body(reader, size, with_delimiter).await?;
+    Some((string, size_bytes + string_bytes))
+}
+
+async fn read_binary_string_size(reader: &mut (impl AsyncBufReadExt + Unpin)) -> Option<(usize, usize)> {
     return read_int(reader, "$", false, 300).await
 }
 
-async fn read_binary_string_body(reader: &mut (impl AsyncBufReadExt + Unpin), expected_size: usize, with_delimiter: bool) -> Option<Vec<u8>> {
+async fn read_binary_string_body(reader: &mut (impl AsyncBufReadExt + Unpin), expected_size: usize, with_delimiter: bool) -> Option<(Vec<u8>, usize)> {
     let mut buffer_size = expected_size;
     if with_delimiter {
         buffer_size += DELIMITER_BYTES.len();
@@ -115,7 +125,7 @@ async fn read_binary_string_body(reader: &mut (impl AsyncBufReadExt + Unpin), ex
         }
         result.truncate(result.len() - DELIMITER_BYTES.len());
     }
-    Some(result)
+    Some((result, buffer_size))
 }
 
 pub(crate) async fn read_simple_string(reader: &mut (impl AsyncBufReadExt + Unpin), max_size: u64) -> Option<String> {

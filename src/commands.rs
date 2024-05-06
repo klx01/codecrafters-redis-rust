@@ -15,9 +15,9 @@ pub(crate) enum HandlingMode {
     ServerSlaveConnectionMaster,
 }
 
-pub(crate) async fn handle_command(stream: &mut (impl AsyncWriteExt + Unpin), command: &Command, storage: &Storage, server_info: &ServerInfo, mode: HandlingMode) -> Option<()> {
+pub(crate) async fn handle_command(stream: &mut (impl AsyncWriteExt + Unpin), command: &Command, storage: &Storage, server_info: &ServerInfo, mode: HandlingMode, bytes_processed: usize) -> Option<()> {
     let write_result = exec_with_timeout(
-        handle_command_inner(stream, &command, &storage, &server_info, mode)
+        handle_command_inner(stream, &command, &storage, &server_info, mode, bytes_processed)
     ).await;
     match write_result {
         Ok(x) => x,
@@ -28,14 +28,14 @@ pub(crate) async fn handle_command(stream: &mut (impl AsyncWriteExt + Unpin), co
     }
 }
 
-async fn handle_command_inner(stream: &mut (impl AsyncWriteExt + Unpin), (command_name, command_params): &Command, storage: &Storage, server_info: &ServerInfo, mode: HandlingMode) -> Option<()> {
+async fn handle_command_inner(stream: &mut (impl AsyncWriteExt + Unpin), (command_name, command_params): &Command, storage: &Storage, server_info: &ServerInfo, mode: HandlingMode, bytes_processed: usize) -> Option<()> {
     match command_name.as_str() {
-        "PING" => ping(stream).await,
+        "PING" => ping(stream, mode).await,
         "ECHO" => echo(stream, command_params).await,
         "GET" => get(stream, command_params, storage).await,
-        "SET" => set(stream, command_params, storage, server_info, mode).await,
+        "SET" => set(stream, command_params, storage, mode).await,
         "INFO" => info(stream, command_params, server_info, storage).await,
-        "REPLCONF" => repl_conf(stream, command_params, server_info).await,
+        "REPLCONF" => repl_conf(stream, command_params, server_info, bytes_processed).await,
         "PSYNC" => psync(stream, command_params, server_info).await,
         _ => {
             eprintln!("received unknown command {command_name}");
@@ -44,8 +44,12 @@ async fn handle_command_inner(stream: &mut (impl AsyncWriteExt + Unpin), (comman
     }
 }
 
-async fn ping(stream: &mut (impl AsyncWriteExt + Unpin)) -> Option<()> {
-    write_simple_string(stream, "PONG").await
+async fn ping(stream: &mut (impl AsyncWriteExt + Unpin), mode: HandlingMode) -> Option<()> {
+    if mode == HandlingMode::ServerSlaveConnectionMaster {
+        Some(())
+    } else {
+        write_simple_string(stream, "PONG").await
+    }
 }
 
 async fn echo(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>]) -> Option<()> {
@@ -65,9 +69,13 @@ async fn get(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], stor
     write_binary_string_or_null(stream, result).await
 }
 
-async fn set(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], storage: &Storage, server_info: &ServerInfo, mode: HandlingMode) -> Option<()> {
-    if server_info.is_slave && (mode != HandlingMode::ServerSlaveConnectionMaster) {
+async fn set(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], storage: &Storage, mode: HandlingMode) -> Option<()> {
+    if mode == HandlingMode::ServerSlaveConnectionExternal {
         eprintln!("set command was called for slave by non-master");
+        return Some(());
+    }
+    if mode == HandlingMode::ServerMasterConnectionSlave {
+        eprintln!("set command was called for master by slave");
         return Some(());
     }
     let Some((key, params)) = params.split_first() else {
@@ -86,7 +94,7 @@ async fn set(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], stor
         expires_at: expiry,
     };
     storage.set(key.clone(), item);
-    if server_info.is_slave {
+    if mode == HandlingMode::ServerSlaveConnectionMaster {
         Some(())
     } else {
         write_simple_string(stream, "OK").await
@@ -140,7 +148,7 @@ master_repl_offset:{}
     write_binary_string(stream, result, true).await
 }
 
-async fn repl_conf(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], info: &ServerInfo) -> Option<()> {
+async fn repl_conf(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], info: &ServerInfo, bytes_processed: usize) -> Option<()> {
     let Some((subcommand, params)) = split_and_parse_str(params) else {
         return Some(());
     };
@@ -148,7 +156,7 @@ async fn repl_conf(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>]
     match subcommand.as_str() {
         "CAPA" => repl_conf_capa(stream, params, info).await,
         "LISTENING-PORT" => repl_conf_port(stream, params, info).await,
-        "GETACK" => repl_conf_get_ack(stream, params, info).await,
+        "GETACK" => repl_conf_get_ack(stream, params, info, bytes_processed).await,
         "ACK" => repl_conf_ack(stream, params, info).await,
         _ => {
             eprintln!("unknown replconf subcommand {subcommand}");
@@ -179,7 +187,7 @@ async fn repl_conf_port(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec
     write_simple_string(stream, "OK").await
 }
 
-async fn repl_conf_get_ack(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], info: &ServerInfo) -> Option<()> {
+async fn repl_conf_get_ack(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], info: &ServerInfo, bytes_processed: usize) -> Option<()> {
     if !info.is_slave {
         eprintln!("received replconf getack as master");
         return Some(());
@@ -187,18 +195,18 @@ async fn repl_conf_get_ack(stream: &mut (impl AsyncWriteExt + Unpin), params: &[
     let Some(_) = split_and_assert_value(params, b"*") else {
         return Some(());
     };
-    write_array_of_strings(stream, ["REPLCONF", "ACK", "0"]).await
+    write_array_of_strings(stream, ["REPLCONF", "ACK", bytes_processed.to_string().as_str()]).await
 }
 
-async fn repl_conf_ack(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], info: &ServerInfo) -> Option<()> {
+async fn repl_conf_ack(_stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], info: &ServerInfo) -> Option<()> {
     if info.is_slave {
-        eprintln!("received replconf getack as a slave");
+        eprintln!("received replconf ack as a slave");
         return Some(());
     }
     let Some(_) = split_and_parse_value::<usize>(params) else {
         return Some(());
     };
-    write_array_of_strings(stream, ["REPLCONF", "ACK", "0"]).await
+    Some(())
 }
 
 async fn psync(stream: &mut (impl AsyncWriteExt + Unpin), params: &[Vec<u8>], info: &ServerInfo) -> Option<()> {
