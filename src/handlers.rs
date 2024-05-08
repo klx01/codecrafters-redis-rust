@@ -47,6 +47,7 @@ pub(crate) async fn handle_command(connection: &mut Connection, command: Command
         "INFO" => info(connection, command).await,
         "REPLCONF" => repl_conf(connection, command).await,
         "WAIT" => wait(connection, command).await,
+        "CONFIG" => config(connection, command).await,
         _ => {
             eprintln!("received unknown command {}", command.name);
             Err(HandleError::InvalidArgs)
@@ -159,11 +160,7 @@ master_repl_offset:{}
 
 async fn repl_conf(connection: &mut Connection, command: Command) -> HandleResult<()> {
     let args = command.get_args();
-    let (subcommand, args) = split_arg(args)?;
-    let Some(subcommand) = normalize_name(subcommand) else {
-        eprintln!("invalid replconf subcommand name");
-        return Err(HandleError::InvalidArgs);
-    };
+    let (subcommand, args) = split_subcommand(args)?;
     match subcommand.as_str() {
         "CAPA" => repl_conf_capa(connection, args).await,
         "LISTENING-PORT" => repl_conf_port(connection, args).await,
@@ -246,9 +243,44 @@ async fn wait(connection: &mut Connection, command: Command) -> HandleResult<()>
         .ok_or(HandleError::ResponseFailed)
 }
 
+async fn config(connection: &mut Connection, command: Command) -> HandleResult<()> {
+    let args = command.get_args();
+    let (subcommand, args) = split_subcommand(args)?;
+    match subcommand.as_str() {
+        "GET" => config_get(connection, args).await,
+        _ => {
+            eprintln!("unknown config subcommand {subcommand}");
+            Err(HandleError::InvalidArgs)
+        }
+    }
+}
+
+async fn config_get(connection: &mut Connection, args: &[Vec<u8>]) -> HandleResult<()> {
+    let (key, _) = split_and_parse_str(args)?;
+    match connection.server.config.get(key) {
+        Some(value) => write_array_of_strings(&mut connection.stream, [key.as_bytes(), value]).await,
+        None => write_null(&mut connection.stream).await,
+    }.ok_or(HandleError::ResponseFailed)
+}
+
+fn split_subcommand(args: &[Vec<u8>]) -> HandleResult<(String, &[Vec<u8>])> {
+    let (subcommand, args) = split_arg(args)?;
+    let Some(subcommand) = normalize_name(subcommand) else {
+        eprintln!("invalid subcommand name");
+        return Err(HandleError::InvalidArgs);
+    };
+    Ok((subcommand, args))
+}
+
 fn split_and_parse_value<T: FromStr>(args: &[Vec<u8>]) -> HandleResult<(T, &[Vec<u8>])> {
     let (value, args) = split_arg(args)?;
     let value = parse_value(value)?;
+    Ok((value, args))
+}
+
+fn split_and_parse_str(args: &[Vec<u8>]) -> HandleResult<(&str, &[Vec<u8>])> {
+    let (value, args) = split_arg(args)?;
+    let value = parse_str(value)?;
     Ok((value, args))
 }
 

@@ -16,9 +16,10 @@ pub(crate) struct Server {
     pub storage: Storage,
     pub replication: RwLock<Replication>,
     pub slave_state: RwLock<SlaveState>,
+    pub config: Config,
 }
 impl Server {
-    fn new(master_config: Option<(String, usize)>) -> Self {
+    fn new(config: Config, master_config: Option<(String, usize)>) -> Self {
         let (repl_tx, _) = channel(100);
         let (is_slave, replication_id, offset) = match master_config {
             Some(x) => (true, x.0, x.1),
@@ -34,10 +35,11 @@ impl Server {
                 master_written_offset: 0,
             }),
             slave_state: Default::default(),
+            config,
         }
     }
-    fn new_arc(master_config: Option<(String, usize)>) -> Arc<Self> {
-        Arc::new(Self::new(master_config))
+    fn new_arc(config: Config, master_config: Option<(String, usize)>) -> Arc<Self> {
+        Arc::new(Self::new(config, master_config))
     }
 }
 
@@ -100,11 +102,13 @@ impl SlaveState {
     }
 }
 
-pub(crate) async fn run_master(port: u16) {
-    serve_external_connections(port, Server::new_arc(None)).await
+pub(crate) type Config = HashMap<&'static str, Vec<u8>>;
+
+pub(crate) async fn run_master(port: u16, config: Config) {
+    serve_external_connections(port, Server::new_arc(config, None)).await
 }
 
-pub(crate) async fn run_slave(port: u16, master_addr: &str) {
+pub(crate) async fn run_slave(port: u16, config: Config, master_addr: &str) {
     let master_socket = lookup_host(&master_addr).await
         .expect(format!("Failed to lookup the address of master host {master_addr}").as_str())
         .next()
@@ -115,7 +119,7 @@ pub(crate) async fn run_slave(port: u16, master_addr: &str) {
     let mut master_stream = BufReader::new(master_stream);
     let master_config = master_handshake(&mut master_stream, port).await;
 
-    let server = Server::new_arc(Some(master_config));
+    let server = Server::new_arc(config, Some(master_config));
 
     {
         let server = Arc::clone(&server);
