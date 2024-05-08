@@ -80,7 +80,7 @@ impl SlaveState {
     pub fn update_offset(&mut self, id: usize, offset: usize) -> bool {
         let old_value = self.offsets.get(&id)
             .expect("update should only happen for valid ids");
-        if *old_value < offset {
+        if *old_value > offset {
             return false;
         }
         self.offsets.insert(id, offset);
@@ -92,7 +92,9 @@ impl SlaveState {
     pub fn check_acknowledged(&self, offset: usize) -> (usize, usize) {
         let count_acknowledged = self.offsets
             .iter()
-            .filter(|(_, &v)| v >= offset)
+            .filter(|(_, &v)| {
+                v >= offset
+            })
             .count();
         (count_acknowledged, self.offsets.len() - count_acknowledged)
     }

@@ -64,10 +64,12 @@ impl Connection {
         }
         true
     }
-    pub fn check_acknowledged_replicas(&self) -> (usize, usize) {
+    pub fn get_replicated_offset(&self) -> usize {
         let offset_store = self.replicated_offset_ref()
             .expect(format!("can't check acknowledged replicas for connection kind {:?}", self.kind).as_str());
-        let offset = offset_store.get();
+        offset_store.get()
+    }
+    pub fn check_acknowledged_replicas(&self, offset: usize) -> (usize, usize) {
         self.server.slave_state.read().expect("got poisoned lock")
             .check_acknowledged(offset)
     }

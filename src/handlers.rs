@@ -221,7 +221,8 @@ async fn wait(connection: &mut Connection, command: Command) -> HandleResult<()>
         return Err(HandleError::InvalidArgs);
     }
 
-    let (acked_count, waiting_count) = connection.check_acknowledged_replicas();
+    let need_offset = connection.get_replicated_offset();
+    let (acked_count, waiting_count) = connection.check_acknowledged_replicas(need_offset);
     let acked_count = if (waiting_count > 0) && (acked_count < need_count) {
         // todo: refactor this
         let command = Command{
@@ -235,7 +236,7 @@ async fn wait(connection: &mut Connection, command: Command) -> HandleResult<()>
         };
         connection.replicate(command);
         sleep(Duration::from_millis(timeout)).await;
-        let (acked_count, _) = connection.check_acknowledged_replicas();
+        let (acked_count, _) = connection.check_acknowledged_replicas(need_offset);
         acked_count
     } else {
         acked_count
