@@ -1,4 +1,6 @@
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
 use crate::resp::*;
 
 pub(crate) async fn master_handshake(stream: &mut (impl AsyncBufReadExt + AsyncWriteExt + Unpin), my_port: u16) -> (String, usize) {
@@ -10,27 +12,25 @@ pub(crate) async fn master_handshake(stream: &mut (impl AsyncBufReadExt + AsyncW
     write(stream, ["REPLCONF", "capa", "psync2"]).await;
     read_expect(stream, buf, "+OK\r\n").await;
     write(stream, ["PSYNC", "?", "-1"]).await;
-    let master_config = exec_with_timeout(read_simple_string(stream, 100))
-        .await
-        .expect("timeout when reading config during handshake")
-        .unwrap();
+    let master_config = read_simple_string(stream, 100).await
+        .expect("failed to get config from master");
     let result = parse_master_config(&master_config);
-    exec_with_timeout(read_binary_string(stream, false))
-        .await
-        .expect("timeout when reading RDB file during handshake")
-        .unwrap();
+    read_binary_string(stream, false).await
+        .expect("failed to get file from master");
     result
 }
 
 async fn write<S: AsRef<[u8]>>(stream: &mut (impl AsyncWriteExt + Unpin), message: impl AsRef<[S]>) {
-    exec_with_timeout(write_array_of_strings(stream, message))
+    write_array_of_strings(stream, message)
         .await
-        .expect("timeout when writing during handshake with master")
         .expect("failed to write message during handshake with master");
 }
 
 async fn read<'a>(stream: &mut (impl AsyncBufReadExt + Unpin), buf: &'a mut [u8]) -> &'a [u8] {
-    let read_size = exec_with_timeout(stream.read(buf))
+    let read_size = timeout(
+        Duration::from_millis(1000), 
+        stream.read(buf)
+    )
         .await
         .expect("timeout when reading during handshake")
         .expect("failed to read message during handshake");

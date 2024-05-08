@@ -1,14 +1,13 @@
 use clap::Parser;
-use crate::master::run_master;
-use crate::slave::run_slave;
+use crate::server::{run_master, run_slave};
 
 mod resp;
 mod storage;
 mod handshake;
-mod commands;
-mod master;
-mod misc;
-mod slave;
+mod handlers;
+mod server;
+mod command;
+mod connection;
 
 #[derive(Parser)]
 struct Cli {
