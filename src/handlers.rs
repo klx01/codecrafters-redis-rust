@@ -49,6 +49,7 @@ pub(crate) async fn handle_command(connection: &mut Connection, command: Command
         "WAIT" => wait(connection, command).await,
         "CONFIG" => config(connection, command).await,
         "KEYS" => keys(connection, command).await,
+        "TYPE" => handle_type(connection, command).await,
         _ => {
             eprintln!("received unknown command {}", command.name);
             Err(HandleError::InvalidArgs)
@@ -262,6 +263,15 @@ async fn keys(connection: &mut Connection, command: Command) -> HandleResult<()>
     let keys = connection.server.storage.keys();
     write_array_of_strings(&mut connection.stream, keys).await
         .ok_or(HandleError::ResponseFailed)
+}
+
+async fn handle_type(connection: &mut Connection, command: Command) -> HandleResult<()> {
+    let args = command.get_args();
+    let (key, _) = split_arg(args)?;
+    match connection.server.storage.get(key) {
+        Some(_) => write_simple_string(&mut connection.stream, "string").await,
+        None => write_simple_string(&mut connection.stream, "none").await,
+    }.ok_or(HandleError::ResponseFailed)
 }
 
 async fn config_get(connection: &mut Connection, args: &[Vec<u8>]) -> HandleResult<()> {
