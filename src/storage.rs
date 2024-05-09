@@ -28,6 +28,11 @@ impl Storage {
         }
         return Some(item.value.clone());
     }
+    
+    pub(crate) fn keys(&self) -> Vec<StorageKey> {
+        let guard = self.inner.read().expect("got poisoned lock, can't handle that");
+        return guard.keys().cloned().collect();
+    }
 
     pub(crate) fn set(&self, key: Vec<u8>, item: StorageItem) -> RwLockWriteGuard<StorageInner> {
         let mut guard = self.inner.write().expect("got poisoned lock, can't handle that");
