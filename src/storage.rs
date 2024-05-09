@@ -52,7 +52,7 @@ impl Storage {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct StorageItem {
     pub value: StorageValue,
     pub expires_at: Option<ExpiryTs>,

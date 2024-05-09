@@ -7,7 +7,7 @@ use nom::combinator::opt;
 use nom::error::{ErrorKind, make_error, VerboseError};
 use nom::{IResult, Parser};
 use nom::multi::{many0, many_till};
-use nom::number::complete::{be_i16, be_i32, be_i8, be_u32, be_u64, be_u8};
+use nom::number::complete::{le_i16, le_i32, le_i8, le_u8, le_u32, le_u64};
 use nom::sequence::Tuple;
 use crate::storage::{ExpiryTs, StorageInner, StorageItem, StorageKey};
 
@@ -54,11 +54,11 @@ pub(crate) fn load_file(path: &PathBuf) -> Option<StorageInner> {
 fn parse_file(data: &[u8]) -> FileParseResult<&[u8], Vec<StorageInner>> {
     let (data, (_, _, _, (databases, _), _, _)) = (
         tag(b"REDIS"),
-        be_u32, // version
+        take(4usize), // version
         many0(auxiliary),
         many_till(database, tag([0xFF])),
-        be_u64, // checksum
-        opt(take(1usize)), // for some reason codecrafters' file has one extra byte in the end 
+        le_u64, // checksum
+        opt(take(1usize)), // for some reason codecrafters' file has one extra byte in the end
     ).parse(data)?;
     Ok((data, databases))
 }
@@ -126,12 +126,12 @@ fn expiry(tail: &[u8]) -> FileParseResult<&[u8], ExpiryTs> {
 }
 
 fn expiry_sec(tail: &[u8]) -> FileParseResult<&[u8], ExpiryTs> {
-    (tag([0xFD]), be_u32).parse(tail)
+    (tag([0xFD]), le_u32).parse(tail)
         .map(|(tail, (_, val))| (tail, val as ExpiryTs * 1000))
 }
 
 fn expiry_milli(tail: &[u8]) -> FileParseResult<&[u8], ExpiryTs> {
-    (tag([0xFC]), be_u64).parse(tail)
+    (tag([0xFC]), le_u64).parse(tail)
         .map(|(tail, (_, val))| (tail, val as ExpiryTs))
 }
 
@@ -171,9 +171,9 @@ impl TryFrom<u8> for ValueKind {
 }
 
 fn value_kind(tail: &[u8]) -> FileParseResult<&[u8], ValueKind> {
-    let (tail, kind) = be_u8(tail)?;
+    let (tail, kind) = le_u8(tail)?;
     let Ok(kind) = kind.try_into() else {
-        if (kind != 0xFF) && (kind != 0xFE) { // this can happen after we parse the last key-value, and the next section begins  
+        if (kind != 0xFF) && (kind != 0xFE) { // this can happen after we parse the last key-value, and the next section begins
             eprintln!("unexpected value kind {kind}");
         }
         return Err(nom::Err::Error(make_error(tail, ErrorKind::Verify)));
@@ -213,7 +213,7 @@ fn length_encoded_int(tail: &[u8]) -> FileParseResult<&[u8], i32> {
 }
 
 fn length_encoding_control(tail: &[u8]) -> FileParseResult<&[u8], (u8, u8)> {
-    let (tail, first) = be_u8(tail)?;
+    let (tail, first) = le_u8(tail)?;
     let kind = (first & STRING_CONTROL_BITMASK) >> 6;
     let value = first & !STRING_CONTROL_BITMASK;
     Ok((tail, (kind, value)))
@@ -223,11 +223,11 @@ fn string_normal(tail: &[u8], kind: u8, value: u8) -> FileParseResult<&[u8], Vec
     let (tail, length) = match kind {
         0b00 => (tail, value.into()),
         0b01 => {
-            let (tail, next) = be_u8(tail)?;
-            let value = u16::from_be_bytes([value, next]);
+            let (tail, next) = le_u8(tail)?;
+            let value = u16::from_le_bytes([value, next]);
             (tail, value.into())
         },
-        0b10 => be_u32(tail)?,
+        0b10 => le_u32(tail)?,
         _ => unreachable!(),
     };
     let (tail, string) = take(length)(tail)?;
@@ -253,11 +253,11 @@ fn string_special(tail: &[u8], control: u8) -> FileParseResult<&[u8], Vec<u8>> {
 
 fn integer(tail: &[u8], control: u8) -> FileParseResult<&[u8], i32> {
     let res = match control {
-        0 => be_i8(tail)
+        0 => le_i8(tail)
             .map(|(tail, val)| (tail, val.into())),
-        1 => be_i16(tail)
+        1 => le_i16(tail)
             .map(|(tail, val)| (tail, val.into())),
-        2 => be_i32(tail),
+        2 => le_i32(tail),
         _ => {
             eprintln!("unexpected control value for integer {control}");
             return Err(nom::Err::Error(make_error(tail, ErrorKind::Verify)));
