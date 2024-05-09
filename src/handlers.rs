@@ -1,12 +1,12 @@
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::broadcast::Receiver;
 use tokio::time::sleep;
 use crate::command::{Command, normalize_name};
 use crate::connection::{Connection, ConnectionKind};
 use crate::resp::*;
-use crate::storage::{StorageItem, StorageKey};
+use crate::storage::{ExpiryTs, now_ts, StorageItem, StorageKey};
 
 const EMPTY_RDB_FILE_HEX: &str = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
 
@@ -102,7 +102,7 @@ fn parse_set_args(args: &[Vec<u8>]) -> HandleResult<(StorageKey, StorageItem)> {
     Ok((key.clone(), item))
 }
 
-fn parse_expiry(args: &[Vec<u8>]) -> HandleResult<Option<Instant>> {
+fn parse_expiry(args: &[Vec<u8>]) -> HandleResult<Option<ExpiryTs>> {
     if args.len() == 0 {
         return Ok(None);
     }
@@ -117,8 +117,8 @@ fn parse_expiry(args: &[Vec<u8>]) -> HandleResult<Option<Instant>> {
             return Err(HandleError::InvalidArgs);
         }
     };
-    let expiry_value = parse_value(expiry_value)?;
-    let expires_at = Instant::now() + Duration::from_millis(expiry_value);
+    let expiry_value = parse_value::<u128>(expiry_value)?;
+    let expires_at = now_ts() + expiry_value;
     Ok(Some(expires_at))
 }
 

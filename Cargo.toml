@@ -25,6 +25,7 @@ thiserror = "^1"                                # error handling
 tokio = { version = "^1", features = ["full"] } # async networking
 clap = { version = "^4", features = ["derive"]}
 hex = "^0.4"
+nom = "^7"
 
 [profile.release]
 strip = "none"

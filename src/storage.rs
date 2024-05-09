@@ -1,16 +1,21 @@
 use std::collections::HashMap;
 use std::sync::{RwLock, RwLockWriteGuard};
-use std::time::Instant;
+use std::time::SystemTime;
 
 type StorageValue = Vec<u8>;
 pub(crate) type StorageKey = Vec<u8>;
-type StorageInner = HashMap<StorageKey, StorageItem>;
+pub(crate) type StorageInner = HashMap<StorageKey, StorageItem>;
+pub(crate) type ExpiryTs = u128;
 
 #[derive(Default)]
 pub(crate) struct Storage {
     inner: RwLock<StorageInner>
 }
 impl Storage {
+    pub(crate) fn new(inner: StorageInner) -> Self {
+        Self{ inner: RwLock::new(inner) }
+    }
+    
     pub(crate) fn get(&self, key: &StorageKey) -> Option<StorageValue> {
         let guard = self.inner.read().expect("got poisoned lock, can't handle that");
         let Some(item) = guard.get(key) else {
@@ -42,15 +47,22 @@ impl Storage {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct StorageItem {
     pub value: StorageValue,
-    pub expires_at: Option<Instant>,
+    pub expires_at: Option<ExpiryTs>,
 }
 impl StorageItem {
     pub fn is_expired(&self) -> bool {
         let Some(expires_at) = self.expires_at else {
             return false;
         };
-        return expires_at < Instant::now();
+        expires_at < now_ts()
     }
+}
+
+pub(crate) fn now_ts() -> ExpiryTs {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
+        .expect("failed to get timestamp!")
+        .as_millis()
 }

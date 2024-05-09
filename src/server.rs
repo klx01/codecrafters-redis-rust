@@ -7,7 +7,7 @@ use tokio::sync::broadcast::{channel, Receiver, Sender};
 use crate::command::Command;
 use crate::connection::{handle_external, handle_master, handle_slave};
 use crate::handshake::master_handshake;
-use crate::storage::Storage;
+use crate::storage::{Storage, StorageInner};
 
 pub(crate) struct Server {
     pub is_slave: bool,
@@ -19,7 +19,7 @@ pub(crate) struct Server {
     pub config: Config,
 }
 impl Server {
-    fn new(config: Config, master_config: Option<(String, usize)>) -> Self {
+    fn new(storage: StorageInner, config: Config, master_config: Option<(String, usize)>) -> Self {
         let (repl_tx, _) = channel(100);
         let (is_slave, replication_id, offset) = match master_config {
             Some(x) => (true, x.0, x.1),
@@ -29,7 +29,7 @@ impl Server {
             is_slave,
             replication_id,
             slave_read_offset: offset.into(),
-            storage: Default::default(),
+            storage: Storage::new(storage),
             replication: RwLock::new(Replication {
                 sender: repl_tx,
                 master_written_offset: 0,
@@ -38,8 +38,8 @@ impl Server {
             config,
         }
     }
-    fn new_arc(config: Config, master_config: Option<(String, usize)>) -> Arc<Self> {
-        Arc::new(Self::new(config, master_config))
+    fn new_arc(storage: StorageInner, config: Config, master_config: Option<(String, usize)>) -> Arc<Self> {
+        Arc::new(Self::new(storage, config, master_config))
     }
 }
 
@@ -104,11 +104,11 @@ impl SlaveState {
 
 pub(crate) type Config = HashMap<&'static str, Vec<u8>>;
 
-pub(crate) async fn run_master(port: u16, config: Config) {
-    serve_external_connections(port, Server::new_arc(config, None)).await
+pub(crate) async fn run_master(storage: StorageInner, port: u16, config: Config) {
+    serve_external_connections(port, Server::new_arc(storage, config, None)).await
 }
 
-pub(crate) async fn run_slave(port: u16, config: Config, master_addr: &str) {
+pub(crate) async fn run_slave(storage: StorageInner, port: u16, config: Config, master_addr: &str) {
     let master_socket = lookup_host(&master_addr).await
         .expect(format!("Failed to lookup the address of master host {master_addr}").as_str())
         .next()
@@ -119,7 +119,7 @@ pub(crate) async fn run_slave(port: u16, config: Config, master_addr: &str) {
     let mut master_stream = BufReader::new(master_stream);
     let master_config = master_handshake(&mut master_stream, port).await;
 
-    let server = Server::new_arc(config, Some(master_config));
+    let server = Server::new_arc(storage, config, Some(master_config));
 
     {
         let server = Arc::clone(&server);
