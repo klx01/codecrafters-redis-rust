@@ -143,6 +143,7 @@ pub(crate) type StorageItemStream = Vec<StreamEntry>;
 #[derive(Clone, Debug)]
 pub(crate) struct StreamEntry {
     pub id: StreamEntryId,
+    #[allow(dead_code)]
     pub data: HashMap<StorageKey, BinaryData>,
 }
 pub(crate) type StreamEntryId = Vec<u8>;

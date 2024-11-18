@@ -141,6 +141,7 @@ pub(crate) async fn write_simple_string(stream: &mut (impl AsyncWriteExt + Unpin
     }).await
 }
 
+#[allow(dead_code)]
 pub(crate) async fn write_binary_string_or_null(stream: &mut (impl AsyncWriteExt + Unpin), string: Option<impl AsRef<[u8]>>) -> Option<()> {
     match string {
         Some(value) => write_binary_string(stream, &value, true).await,
