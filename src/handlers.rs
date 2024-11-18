@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -6,7 +7,7 @@ use tokio::time::sleep;
 use crate::command::{Command, normalize_name};
 use crate::connection::{Connection, ConnectionKind};
 use crate::resp::*;
-use crate::storage::{ExpiryTs, now_ts, StorageItem, StorageKey};
+use crate::storage::{ExpiryTs, now_ts, StorageItemString, StorageKey, StreamEntry};
 
 const EMPTY_RDB_FILE_HEX: &str = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
 
@@ -50,6 +51,7 @@ pub(crate) async fn handle_command(connection: &mut Connection, command: Command
         "CONFIG" => config(connection, command).await,
         "KEYS" => keys(connection, command).await,
         "TYPE" => handle_type(connection, command).await,
+        "XADD" => xadd(connection, command).await,
         _ => {
             eprintln!("received unknown command {}", command.name);
             Err(HandleError::InvalidArgs)
@@ -74,7 +76,7 @@ async fn echo(connection: &mut Connection, command: Command) -> HandleResult<()>
 
 async fn get(connection: &mut Connection, command: Command) -> HandleResult<()> {
     let (key, _) = split_arg(command.get_args())?;
-    let result = connection.server.storage.get(key);
+    let result = connection.server.storage.get_string(key);
     write_binary_string_or_null(&mut connection.stream, result).await
         .ok_or(HandleError::ResponseFailed)
 }
@@ -94,10 +96,10 @@ async fn set(connection: &mut Connection, command: Command) -> HandleResult<()> 
     }
 }
 
-fn parse_set_args(args: &[Vec<u8>]) -> HandleResult<(StorageKey, StorageItem)> {
+fn parse_set_args(args: &[Vec<u8>]) -> HandleResult<(StorageKey, StorageItemString)> {
     let (key, args) = split_arg(args)?;
     let (value, args) = split_arg(args)?;
-    let item = StorageItem {
+    let item = StorageItemString {
         value: value.clone(),
         expires_at: parse_expiry(args)?,
     };
@@ -124,13 +126,13 @@ fn parse_expiry(args: &[Vec<u8>]) -> HandleResult<Option<ExpiryTs>> {
     Ok(Some(expires_at))
 }
 
-fn do_set(connection: &mut Connection, key: StorageKey, item: StorageItem, command: Command) {
+fn do_set(connection: &mut Connection, key: StorageKey, item: StorageItemString, command: Command) {
     /*
     We need to ensure that replicas have exactly the same state as master,
     so if there are concurrent updates to the same key, replicas need to receive them in the same order as they were applied in master,
     so sending commands to replicas should be done under the same lock as the updates.
      */
-    let guard = connection.server.storage.set(key, item);
+    let guard = connection.server.storage.set_string(key, item);
     connection.replicate(command);
     drop(guard); // guard is unused, it just needs to exist until the end of scope
 }
@@ -257,6 +259,14 @@ async fn config(connection: &mut Connection, command: Command) -> HandleResult<(
     }
 }
 
+async fn config_get(connection: &mut Connection, args: &[Vec<u8>]) -> HandleResult<()> {
+    let (key, _) = split_and_parse_str(args)?;
+    match connection.server.config.get(key) {
+        Some(value) => write_array_of_strings(&mut connection.stream, [key.as_bytes(), value]).await,
+        None => write_null(&mut connection.stream).await,
+    }.ok_or(HandleError::ResponseFailed)
+}
+
 async fn keys(connection: &mut Connection, command: Command) -> HandleResult<()> {
     let args = command.get_args();
     split_and_assert_value(args, b"*")?;
@@ -268,18 +278,57 @@ async fn keys(connection: &mut Connection, command: Command) -> HandleResult<()>
 async fn handle_type(connection: &mut Connection, command: Command) -> HandleResult<()> {
     let args = command.get_args();
     let (key, _) = split_arg(args)?;
-    match connection.server.storage.get(key) {
-        Some(_) => write_simple_string(&mut connection.stream, "string").await,
-        None => write_simple_string(&mut connection.stream, "none").await,
-    }.ok_or(HandleError::ResponseFailed)
+    let kind = connection.server.storage.get_value_kind(key);
+    write_simple_string(&mut connection.stream, kind).await
+        .ok_or(HandleError::ResponseFailed)
 }
 
-async fn config_get(connection: &mut Connection, args: &[Vec<u8>]) -> HandleResult<()> {
-    let (key, _) = split_and_parse_str(args)?;
-    match connection.server.config.get(key) {
-        Some(value) => write_array_of_strings(&mut connection.stream, [key.as_bytes(), value]).await,
-        None => write_null(&mut connection.stream).await,
-    }.ok_or(HandleError::ResponseFailed)
+async fn xadd(connection: &mut Connection, command: Command) -> HandleResult<()> {
+    if !connection.can_replicate() {
+        eprintln!("xadd command was called via readonly connection");
+        return Err(HandleError::InvalidArgs);
+    }
+    let (key, item) = parse_xadd_args(command.get_args())?;
+    let id = item.id.clone(); // todo: would it be possible not to clone it?
+    do_xadd(connection, key, item, command)?;
+    if connection.server.is_slave {
+        Ok(())
+    } else {
+        write_binary_string(&mut connection.stream, id, true).await
+            .ok_or(HandleError::ResponseFailed)
+    }
+}
+fn parse_xadd_args(args: &[Vec<u8>]) -> HandleResult<(StorageKey, StreamEntry)> {
+    let (key, args) = split_arg(args)?;
+    let (item_id, args) = split_arg(args)?;
+    let mut args = args;
+    let mut entry_data = HashMap::new();
+    while !args.is_empty() {
+        let args2 = args;
+        let (entry_key, args2) = split_arg(args2)?;
+        let (entry_value, args2) = split_arg(args2)?;
+        args = args2;
+        entry_data.insert(entry_key.clone(), entry_value.clone());
+    }
+    let item = StreamEntry {
+        id: item_id.clone(),
+        data: entry_data,
+    };
+    Ok((key.clone(), item))
+}
+fn do_xadd(connection: &mut Connection, key: StorageKey, item: StreamEntry, command: Command) -> HandleResult<()> {
+    /*
+    We need to ensure that replicas have exactly the same state as master,
+    so if there are concurrent updates to the same key, replicas need to receive them in the same order as they were applied in master,
+    so sending commands to replicas should be done under the same lock as the updates.
+     */
+    let Some(guard) = connection.server.storage.append_to_stream(key, item) else {
+        eprintln!("key is not a stream");
+        return Err(HandleError::InvalidArgs);
+    };
+    connection.replicate(command);
+    drop(guard); // guard is unused, it just needs to exist until the end of scope
+    Ok(())
 }
 
 fn split_subcommand(args: &[Vec<u8>]) -> HandleResult<(String, &[Vec<u8>])> {
