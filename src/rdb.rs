@@ -9,7 +9,7 @@ use nom::{IResult, Parser};
 use nom::multi::{many0, many_till};
 use nom::number::complete::{le_i16, le_i32, le_i8, le_u8, le_u32, le_u64};
 use nom::sequence::Tuple;
-use crate::storage::{ExpiryTs, StorageInner, StorageItem, StorageItemString, StorageKey};
+use crate::storage::{ExpiryTs, StorageInner, StorageItem, StorageItemSimple, StorageKey};
 
 const STRING_CONTROL_BITMASK: u8 = 0b11000000;
 
@@ -183,7 +183,7 @@ fn value_kind(tail: &[u8]) -> FileParseResult<&[u8], ValueKind> {
 fn value(tail: &[u8], kind: ValueKind, expires_at: Option<ExpiryTs>) -> FileParseResult<&[u8], StorageItem> {
     match kind {
         ValueKind::String => length_encoded_string(tail)
-            .map(|(tail, value)| (tail, StorageItem::String(StorageItemString{value, expires_at}))),
+            .map(|(tail, value)| (tail, StorageItem::Simple(StorageItemSimple::from_data(value, expires_at)))),
         _ => {
             eprintln!("parsing value kind {kind:?} is not implemented yet");
             return Err(nom::Err::Error(make_error(tail, ErrorKind::Verify)));
