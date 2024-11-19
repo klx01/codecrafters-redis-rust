@@ -12,9 +12,25 @@ use crate::transaction::QueuedCommand;
 
 const EMPTY_RDB_FILE_HEX: &str = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
 
+const INVALID_ARGS_DEFAULT: HandleError = HandleError::InvalidArgs(ArgsError::Generic);
+
 pub(crate) enum HandleError {
-    InvalidArgs,
+    InvalidArgs(ArgsError),
     ResponseFailed,
+}
+#[derive(Default)]
+pub(crate) enum ArgsError {
+    #[default]
+    Generic,
+    CanNotIncrementThisValue,
+}
+impl ArgsError {
+    pub(crate) fn get_message(&self) -> &'static str {
+        match self {
+            ArgsError::Generic => "Invalid args",
+            ArgsError::CanNotIncrementThisValue => "ERR value is not an integer or out of range",
+        }
+    }
 }
 type HandleResult<T> = Result<T, HandleError>;
 
@@ -35,7 +51,7 @@ pub(crate) async fn handle_command_ignore_invalid(connection: &mut Connection, c
     let res = handle_command(connection, command).await;
     match res {
         Ok(x) => Some(x),
-        Err(HandleError::InvalidArgs) => Some(()),
+        Err(HandleError::InvalidArgs(_)) => Some(()),
         Err(HandleError::ResponseFailed) => None,
     }
 }
@@ -57,7 +73,7 @@ pub(crate) async fn handle_command(connection: &mut Connection, command: Command
         "MULTI" => multi(connection).await,
         _ => {
             eprintln!("received unknown command {} {:?}", command.name, command.raw);
-            Err(HandleError::InvalidArgs)
+            Err(INVALID_ARGS_DEFAULT)
         },
     }
 }
@@ -91,7 +107,7 @@ async fn get(connection: &mut Connection, command: Command) -> HandleResult<()> 
 async fn set(connection: &mut Connection, command: Command) -> HandleResult<()> {
     if !connection.can_replicate() {
         eprintln!("set command was called via readonly connection");
-        return Err(HandleError::InvalidArgs);
+        return Err(INVALID_ARGS_DEFAULT);
     }
     let (key, item) = parse_set_args(command.get_args())?;
     if let Some(transaction) = connection.get_transaction_mut() {
@@ -130,7 +146,7 @@ fn parse_expiry(args: &[Vec<u8>]) -> HandleResult<Option<ExpiryTs>> {
         Some(x) => x,
         None => {
             eprintln!("No value found for the expiry param");
-            return Err(HandleError::InvalidArgs);
+            return Err(INVALID_ARGS_DEFAULT);
         }
     };
     let expiry_value = parse_value::<u128>(expiry_value)?;
@@ -188,7 +204,7 @@ async fn repl_conf(connection: &mut Connection, command: Command) -> HandleResul
         "ACK" => repl_conf_ack(connection, args).await,
         _ => {
             eprintln!("unknown replconf subcommand {subcommand}");
-            Err(HandleError::InvalidArgs)
+            Err(INVALID_ARGS_DEFAULT)
         }
     }
 }
@@ -208,7 +224,7 @@ async fn repl_conf_port(connection: &mut Connection, args: &[Vec<u8>]) -> Handle
 async fn repl_conf_get_ack(connection: &mut Connection, args: &[Vec<u8>]) -> HandleResult<()> {
     if !connection.server.is_slave {
         eprintln!("received replconf getack as master");
-        return Err(HandleError::InvalidArgs);
+        return Err(INVALID_ARGS_DEFAULT);
     }
     split_and_assert_value(args, b"*")?;
     let offset = connection.server.slave_read_offset.load(Ordering::Acquire).to_string();
@@ -220,7 +236,7 @@ async fn repl_conf_ack(connection: &mut Connection, args: &[Vec<u8>]) -> HandleR
     let (offset, _) = split_and_parse_value::<usize>(args)?;
     let success = connection.update_acknowledged_offset(offset);
     if !success {
-        return Err(HandleError::InvalidArgs);
+        return Err(INVALID_ARGS_DEFAULT);
     }
     Ok(())
 }
@@ -228,14 +244,14 @@ async fn repl_conf_ack(connection: &mut Connection, args: &[Vec<u8>]) -> HandleR
 async fn wait(connection: &mut Connection, command: Command) -> HandleResult<()> {
     if !matches!(connection.kind, ConnectionKind::ServerMasterConnectionExternal{..}) {
         eprintln!("wait command was called via readonly connection");
-        return Err(HandleError::InvalidArgs);
+        return Err(INVALID_ARGS_DEFAULT);
     }
     let args = command.get_args();
     let (need_count, args) = split_and_parse_value::<usize>(args)?;
     let (timeout, _) = split_and_parse_value(args)?;
     if timeout > 600000 {
         eprintln!("timeout is too long");
-        return Err(HandleError::InvalidArgs);
+        return Err(INVALID_ARGS_DEFAULT);
     }
 
     let need_offset = connection.get_replicated_offset();
@@ -270,7 +286,7 @@ async fn config(connection: &mut Connection, command: Command) -> HandleResult<(
         "GET" => config_get(connection, args).await,
         _ => {
             eprintln!("unknown config subcommand {subcommand}");
-            Err(HandleError::InvalidArgs)
+            Err(INVALID_ARGS_DEFAULT)
         }
     }
 }
@@ -302,7 +318,7 @@ async fn handle_type(connection: &mut Connection, command: Command) -> HandleRes
 async fn xadd(connection: &mut Connection, command: Command) -> HandleResult<()> {
     if !connection.can_replicate() {
         eprintln!("xadd command was called via readonly connection");
-        return Err(HandleError::InvalidArgs);
+        return Err(INVALID_ARGS_DEFAULT);
     }
     let (key, item) = parse_xadd_args(command.get_args())?;
     if let Some(transaction) = connection.get_transaction_mut() {
@@ -347,7 +363,7 @@ fn do_xadd(connection: &mut Connection, key: StorageKey, item: StreamEntry, comm
      */
     let Some(guard) = connection.server.storage.append_to_stream(key, item) else {
         eprintln!("can't do xadd when key is not a stream");
-        return Err(HandleError::InvalidArgs);
+        return Err(INVALID_ARGS_DEFAULT);
     };
     connection.replicate(command);
     drop(guard); // guard is unused, it just needs to exist until the end of scope
@@ -357,7 +373,7 @@ fn do_xadd(connection: &mut Connection, key: StorageKey, item: StreamEntry, comm
 async fn incr(connection: &mut Connection, command: Command) -> HandleResult<()> {
     if !connection.can_replicate() {
         eprintln!("incr command was called via readonly connection");
-        return Err(HandleError::InvalidArgs);
+        return Err(INVALID_ARGS_DEFAULT);
     }
     let (key, _args) = split_arg(command.get_args())?;
     let key = key.clone();
@@ -385,7 +401,7 @@ fn do_incr(connection: &mut Connection, key: StorageKey, command: Command) -> Ha
      */
     let Some((guard, value)) = connection.server.storage.increment(key) else {
         eprintln!("can't do incr when key is not an int");
-        return Err(HandleError::InvalidArgs);
+        return Err(HandleError::InvalidArgs(ArgsError::CanNotIncrementThisValue));
     };
     connection.replicate(command);
     drop(guard); // guard is unused, it just needs to exist until the end of scope
@@ -395,7 +411,7 @@ fn do_incr(connection: &mut Connection, key: StorageKey, command: Command) -> Ha
 async fn multi(connection: &mut Connection) -> HandleResult<()> {
     let Some(transaction) = connection.get_transaction_mut() else {
         eprintln!("multi command was called on a wrong type of connection");
-        return Err(HandleError::InvalidArgs);
+        return Err(INVALID_ARGS_DEFAULT);
     };
     transaction.started = true;
     write_simple_string(&mut connection.stream, "OK").await
@@ -406,7 +422,7 @@ fn split_subcommand(args: &[Vec<u8>]) -> HandleResult<(String, &[Vec<u8>])> {
     let (subcommand, args) = split_arg(args)?;
     let Some(subcommand) = normalize_name(subcommand) else {
         eprintln!("invalid subcommand name");
-        return Err(HandleError::InvalidArgs);
+        return Err(INVALID_ARGS_DEFAULT);
     };
     Ok((subcommand, args))
 }
@@ -426,7 +442,7 @@ fn split_and_parse_str(args: &[Vec<u8>]) -> HandleResult<(&str, &[Vec<u8>])> {
 fn split_arg(args: &[Vec<u8>]) -> HandleResult<(&Vec<u8>, &[Vec<u8>])> {
     let Some((value, args)) = args.split_first() else {
         eprintln!("missing parameter");
-        return Err(HandleError::InvalidArgs);
+        return Err(INVALID_ARGS_DEFAULT);
     };
     Ok((value, args))
 }
@@ -437,7 +453,7 @@ fn parse_value<T: FromStr>(value: &[u8]) -> HandleResult<T> {
         Ok(x) => Ok(x),
         Err(_) => {
             eprintln!("value is not valid: {value}");
-            Err(HandleError::InvalidArgs)
+            Err(INVALID_ARGS_DEFAULT)
         }
     }
 }
@@ -447,7 +463,7 @@ fn parse_str(value: &[u8]) -> HandleResult<&str> {
         Ok(x) => Ok(x),
         Err(error) => {
             eprintln!("value is not a valid string {error}");
-            Err(HandleError::InvalidArgs)
+            Err(INVALID_ARGS_DEFAULT)
         }
     }
 }
@@ -456,7 +472,7 @@ fn split_and_assert_value<'a>(args: &'a [Vec<u8>], expected: &[u8]) -> HandleRes
     let (value, args) = split_arg(args)?;
     if value != expected {
         eprintln!("unexpected parameter value");
-        return Err(HandleError::InvalidArgs);
+        return Err(INVALID_ARGS_DEFAULT);
     }
     Ok(args)
 }

@@ -158,8 +158,8 @@ pub(crate) async fn handle_external(stream: TcpStream, server: Arc<Server>) -> O
 
 async fn handle_err(err: HandleError, stream: &mut (impl AsyncWriteExt + Unpin)) -> Option<()> {
     match err {
-        HandleError::InvalidArgs => {
-            write_simple_error(stream, "Invalid args").await?;
+        HandleError::InvalidArgs(err) => {
+            write_simple_error(stream, err.get_message()).await?;
             Some(())
         },
         HandleError::ResponseFailed => None,
