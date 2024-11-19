@@ -8,6 +8,7 @@ use crate::command::{Command, normalize_name};
 use crate::connection::{Connection, ConnectionKind};
 use crate::resp::*;
 use crate::storage::{ExpiryTs, now_ts, StorageItemSimple, StorageKey, StreamEntry, SimpleValue};
+use crate::transaction::QueuedCommand;
 
 const EMPTY_RDB_FILE_HEX: &str = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
 
@@ -53,8 +54,9 @@ pub(crate) async fn handle_command(connection: &mut Connection, command: Command
         "TYPE" => handle_type(connection, command).await,
         "XADD" => xadd(connection, command).await,
         "INCR" => incr(connection, command).await,
+        "MULTI" => multi(connection).await,
         _ => {
-            eprintln!("received unknown command {}", command.name);
+            eprintln!("received unknown command {} {:?}", command.name, command.raw);
             Err(HandleError::InvalidArgs)
         },
     }
@@ -92,6 +94,13 @@ async fn set(connection: &mut Connection, command: Command) -> HandleResult<()> 
         return Err(HandleError::InvalidArgs);
     }
     let (key, item) = parse_set_args(command.get_args())?;
+    if let Some(transaction) = connection.get_transaction_mut() {
+        if transaction.started {
+            transaction.queue.push(QueuedCommand::Set{key, item});
+            return write_simple_string(&mut connection.stream, "QUEUED").await
+                .ok_or(HandleError::ResponseFailed);
+        }
+    }
     do_set(connection, key, item, command);
     if connection.server.is_slave {
         Ok(())
@@ -144,6 +153,10 @@ async fn info(connection: &mut Connection, command: Command) -> HandleResult<()>
     for section in command.get_args() {
         match section.as_slice() {
             b"replication" => info_replication(connection).await?,
+            b"SERVER" => {
+                write_binary_string(&mut connection.stream, "# Server\n", true).await
+                    .ok_or(HandleError::ResponseFailed)?
+            },
             _ => eprintln!("Unknown section {:?}", std::str::from_utf8(&section)),
         };
     }
@@ -292,6 +305,13 @@ async fn xadd(connection: &mut Connection, command: Command) -> HandleResult<()>
         return Err(HandleError::InvalidArgs);
     }
     let (key, item) = parse_xadd_args(command.get_args())?;
+    if let Some(transaction) = connection.get_transaction_mut() {
+        if transaction.started {
+            transaction.queue.push(QueuedCommand::Xadd{key, item});
+            return write_simple_string(&mut connection.stream, "QUEUED").await
+                .ok_or(HandleError::ResponseFailed);
+        }
+    }
     let id = item.id.clone(); // todo: would it be possible not to clone it?
     do_xadd(connection, key, item, command)?;
     if connection.server.is_slave {
@@ -340,7 +360,15 @@ async fn incr(connection: &mut Connection, command: Command) -> HandleResult<()>
         return Err(HandleError::InvalidArgs);
     }
     let (key, _args) = split_arg(command.get_args())?;
-    let new_value = do_incr(connection, key.clone(), command)?;
+    let key = key.clone();
+    if let Some(transaction) = connection.get_transaction_mut() {
+        if transaction.started {
+            transaction.queue.push(QueuedCommand::Incr{key});
+            return write_simple_string(&mut connection.stream, "QUEUED").await
+                .ok_or(HandleError::ResponseFailed);
+        }
+    }
+    let new_value = do_incr(connection, key, command)?;
     if connection.server.is_slave {
         Ok(())
     } else {
@@ -362,6 +390,16 @@ fn do_incr(connection: &mut Connection, key: StorageKey, command: Command) -> Ha
     connection.replicate(command);
     drop(guard); // guard is unused, it just needs to exist until the end of scope
     Ok(value)
+}
+
+async fn multi(connection: &mut Connection) -> HandleResult<()> {
+    let Some(transaction) = connection.get_transaction_mut() else {
+        eprintln!("multi command was called on a wrong type of connection");
+        return Err(HandleError::InvalidArgs);
+    };
+    transaction.started = true;
+    write_simple_string(&mut connection.stream, "OK").await
+        .ok_or(HandleError::ResponseFailed)
 }
 
 fn split_subcommand(args: &[Vec<u8>]) -> HandleResult<(String, &[Vec<u8>])> {

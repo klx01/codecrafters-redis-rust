@@ -141,6 +141,18 @@ pub(crate) async fn write_simple_string(stream: &mut (impl AsyncWriteExt + Unpin
     }).await
 }
 
+pub(crate) async fn write_simple_error(stream: &mut (impl AsyncWriteExt + Unpin), string: impl AsRef<str>) -> Option<()> {
+    exec_with_timeout(async move {
+        let string = string.as_ref();
+        let result = stream.write_all(format!("-{string}{DELIMITER_STR}").as_bytes()).await;
+        if let Err(error) = result {
+            eprintln!("failed to write simple error: {error}");
+            return None;
+        }
+        Some(())
+    }).await
+}
+
 #[allow(dead_code)]
 pub(crate) async fn write_binary_string_or_null(stream: &mut (impl AsyncWriteExt + Unpin), string: Option<impl AsRef<[u8]>>) -> Option<()> {
     match string {

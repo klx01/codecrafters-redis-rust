@@ -1,15 +1,16 @@
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tokio::io::BufReader;
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::select;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::broadcast::Receiver;
 use crate::command::Command;
-use crate::handlers::{handle_command, handle_command_ignore_invalid, psync};
-use crate::resp::{read_command, write_command};
+use crate::handlers::{handle_command, handle_command_ignore_invalid, psync, HandleError};
+use crate::resp::{read_command, write_command, write_simple_error};
 use crate::server::Server;
+use crate::transaction::Transaction;
 
 pub(crate) struct Connection {
     pub stream: BufReader<TcpStream>,
@@ -20,9 +21,21 @@ impl Connection {
     pub fn can_replicate(&self) -> bool {
         self.replicated_offset_ref().is_some()
     }
+    pub fn is_in_transaction(&self) -> bool {
+        match &self.kind {
+            ConnectionKind::ServerMasterConnectionExternal { transaction, .. } => transaction.started,
+            _ => false,
+        }
+    }
+    pub fn get_transaction_mut(&mut self) -> Option<&mut Transaction> {
+        match &mut self.kind {
+            ConnectionKind::ServerMasterConnectionExternal { transaction, .. } => Some(transaction),
+            _ => None,
+        }
+    }
     fn replicated_offset_ref(&self) -> Option<&Cell<usize>> {
         match &self.kind {
-            ConnectionKind::ServerMasterConnectionExternal { replicated_offset } => Some(replicated_offset),
+            ConnectionKind::ServerMasterConnectionExternal { replicated_offset, .. } => Some(replicated_offset),
             ConnectionKind::ServerSlaveConnectionMaster { replicated_offset } => Some(replicated_offset),
             _ => None,
         }
@@ -88,7 +101,7 @@ impl Drop for Connection {
 
 #[derive(Debug)]
 pub(crate) enum ConnectionKind {
-    ServerMasterConnectionExternal{replicated_offset: Cell<usize>},
+    ServerMasterConnectionExternal{replicated_offset: Cell<usize>, transaction: Transaction},
     ServerMasterConnectionSlave{slave_id: usize},
     ServerSlaveConnectionMaster{replicated_offset: Cell<usize>},
     ServerSlaveConnectionExternal,
@@ -114,7 +127,7 @@ pub(crate) async fn handle_external(stream: TcpStream, server: Arc<Server>) -> O
     let kind = if server.is_slave {
         ConnectionKind::ServerSlaveConnectionExternal
     } else {
-        ConnectionKind::ServerMasterConnectionExternal { replicated_offset: Default::default() }
+        ConnectionKind::ServerMasterConnectionExternal { replicated_offset: Default::default(), transaction: Default::default() }
     };
     let mut connection = Connection {
         stream: BufReader::new(stream),
@@ -128,13 +141,29 @@ pub(crate) async fn handle_external(stream: TcpStream, server: Arc<Server>) -> O
             continue;
         };
         if command.name == "PSYNC" {
-            if let Ok(rx) = psync(&mut connection, command).await {
-                return Some((connection, rx));
+            let res = psync(&mut connection, command).await;
+            match res {
+                Ok(rx) => return Some((connection, rx)),
+                Err(err) => handle_err(err, &mut connection.stream).await?,
             }
         } else {
-            handle_command_ignore_invalid(&mut connection, command).await?;
+            let res = handle_command(&mut connection, command).await;
+            match res {
+                Ok(_) => {},
+                Err(err) => handle_err(err, &mut connection.stream).await?,
+            }
         }
     };
+}
+
+async fn handle_err(err: HandleError, stream: &mut (impl AsyncWriteExt + Unpin)) -> Option<()> {
+    match err {
+        HandleError::InvalidArgs => {
+            write_simple_error(stream, "Invalid args").await?;
+            Some(())
+        },
+        HandleError::ResponseFailed => None,
+    }
 }
 
 pub(crate) async fn handle_slave(connection: Connection, mut repl_receiver: Receiver<Command>) -> Option<()> {

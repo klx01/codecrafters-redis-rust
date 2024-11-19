@@ -13,6 +13,7 @@ mod server;
 mod command;
 mod connection;
 mod rdb;
+mod transaction;
 
 #[derive(Parser)]
 struct Cli {
