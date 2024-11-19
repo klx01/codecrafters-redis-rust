@@ -58,7 +58,7 @@ impl Storage {
     pub(crate) fn increment(&self, key: Vec<u8>) -> Option<(RwLockWriteGuard<StorageInner>, i64)> {
         let mut guard = self.inner.write().expect("got poisoned lock, can't handle that");
         let entry = guard.entry(key)
-            .or_insert_with(|| StorageItem::Simple(StorageItemSimple{ value: SimpleValue::Int(-1), expires_at: None }));
+            .or_insert_with(|| StorageItem::Simple(StorageItemSimple{ value: SimpleValue::Int(0), expires_at: None }));
         let value = match entry {
             StorageItem::Simple(x) => match &mut x.value {
                 SimpleValue::Int(x) => x,

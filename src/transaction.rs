@@ -5,9 +5,6 @@ pub(crate) struct Transaction {
     pub started: bool,
     pub queue: Vec<QueuedCommand>,
 }
-impl Transaction {
-
-}
 
 #[derive(Debug)]
 pub(crate) enum QueuedCommand {
