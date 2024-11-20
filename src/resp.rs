@@ -210,16 +210,27 @@ pub(crate) async fn write_int(stream: &mut (impl AsyncWriteExt + Unpin), value: 
 pub(crate) async fn write_array_of_strings<S: AsRef<[u8]>>(stream: &mut (impl AsyncWriteExt + Unpin), strings: impl AsRef<[S]>) -> Option<()> {
     exec_with_timeout(async move {
         let strings = strings.as_ref();
-        let result = stream.write_all(format!("*{}{DELIMITER_STR}", strings.len()).as_bytes()).await;
-        if let Err(error) = result {
-            eprintln!("failed to write array size: {error}");
-            return None;
-        }
+        do_write_array_size(stream, strings.len()).await?;
         for string in strings {
             write_binary_string(stream, string, true).await?;
         }
         Some(())
     }).await
+}
+
+pub(crate) async fn write_array_size(stream: &mut (impl AsyncWriteExt + Unpin), len: usize) -> Option<()> {
+    exec_with_timeout(async move {
+        do_write_array_size(stream, len).await
+    }).await
+}
+
+async fn do_write_array_size(stream: &mut (impl AsyncWriteExt + Unpin), len: usize) -> Option<()> {
+    let result = stream.write_all(format!("*{}{DELIMITER_STR}", len).as_bytes()).await;
+    if let Err(error) = result {
+        eprintln!("failed to write array size: {error}");
+        return None;
+    }
+    Some(())
 }
 
 pub(crate) async fn write_command(stream: &mut (impl AsyncWriteExt + Unpin), command: Command) -> Option<()> {

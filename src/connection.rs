@@ -21,12 +21,6 @@ impl Connection {
     pub fn can_replicate(&self) -> bool {
         self.replicated_offset_ref().is_some()
     }
-    pub fn is_in_transaction(&self) -> bool {
-        match &self.kind {
-            ConnectionKind::ServerMasterConnectionExternal { transaction, .. } => transaction.started,
-            _ => false,
-        }
-    }
     pub fn get_transaction_mut(&mut self) -> Option<&mut Transaction> {
         match &mut self.kind {
             ConnectionKind::ServerMasterConnectionExternal { transaction, .. } => Some(transaction),

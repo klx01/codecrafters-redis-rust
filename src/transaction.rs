@@ -1,3 +1,4 @@
+use crate::command::Command;
 use crate::storage::{StorageItemSimple, StorageKey, StreamEntry};
 
 #[derive(Default, Debug)]
@@ -8,7 +9,8 @@ pub(crate) struct Transaction {
 
 #[derive(Debug)]
 pub(crate) enum QueuedCommand {
-    Set{key: StorageKey, item: StorageItemSimple},
-    Xadd{key: StorageKey, item: StreamEntry},
-    Incr{key: StorageKey},
+    // todo: think of some better way to replicate commands without saving them here
+    Set{key: StorageKey, item: StorageItemSimple, command: Command},
+    Xadd{key: StorageKey, item: StreamEntry, command: Command},
+    Incr{key: StorageKey, command: Command},
 }

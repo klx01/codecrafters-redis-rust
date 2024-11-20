@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::mem;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -18,21 +19,29 @@ pub(crate) enum HandleError {
     InvalidArgs(ArgsError),
     ResponseFailed,
 }
+impl From<ArgsError> for HandleError {
+    fn from(value: ArgsError) -> Self {
+        Self::InvalidArgs(value)
+    }
+}
 #[derive(Default)]
 pub(crate) enum ArgsError {
     #[default]
     Generic,
     CanNotIncrementThisValue,
+    ExecWithoutMulti,
 }
 impl ArgsError {
     pub(crate) fn get_message(&self) -> &'static str {
         match self {
             ArgsError::Generic => "Invalid args",
             ArgsError::CanNotIncrementThisValue => "ERR value is not an integer or out of range",
+            ArgsError::ExecWithoutMulti => "ERR EXEC without MULTI",
         }
     }
 }
 type HandleResult<T> = Result<T, HandleError>;
+type ExecResult<T> = Result<T, ArgsError>;
 
 pub(crate) async fn psync(connection: &mut Connection, command: Command) -> HandleResult<Receiver<Command>> {
     let args = command.get_args();
@@ -71,6 +80,7 @@ pub(crate) async fn handle_command(connection: &mut Connection, command: Command
         "XADD" => xadd(connection, command).await,
         "INCR" => incr(connection, command).await,
         "MULTI" => multi(connection).await,
+        "EXEC" => exec(connection).await,
         _ => {
             eprintln!("received unknown command {} {:?}", command.name, command.raw);
             Err(INVALID_ARGS_DEFAULT)
@@ -112,7 +122,7 @@ async fn set(connection: &mut Connection, command: Command) -> HandleResult<()> 
     let (key, item) = parse_set_args(command.get_args())?;
     if let Some(transaction) = connection.get_transaction_mut() {
         if transaction.started {
-            transaction.queue.push(QueuedCommand::Set{key, item});
+            transaction.queue.push(QueuedCommand::Set{key, item, command});
             return write_simple_string(&mut connection.stream, "QUEUED").await
                 .ok_or(HandleError::ResponseFailed);
         }
@@ -323,7 +333,7 @@ async fn xadd(connection: &mut Connection, command: Command) -> HandleResult<()>
     let (key, item) = parse_xadd_args(command.get_args())?;
     if let Some(transaction) = connection.get_transaction_mut() {
         if transaction.started {
-            transaction.queue.push(QueuedCommand::Xadd{key, item});
+            transaction.queue.push(QueuedCommand::Xadd{key, item, command});
             return write_simple_string(&mut connection.stream, "QUEUED").await
                 .ok_or(HandleError::ResponseFailed);
         }
@@ -355,7 +365,7 @@ fn parse_xadd_args(args: &[Vec<u8>]) -> HandleResult<(StorageKey, StreamEntry)> 
     };
     Ok((key.clone(), item))
 }
-fn do_xadd(connection: &mut Connection, key: StorageKey, item: StreamEntry, command: Command) -> HandleResult<()> {
+fn do_xadd(connection: &mut Connection, key: StorageKey, item: StreamEntry, command: Command) -> ExecResult<()> {
     /*
     We need to ensure that replicas have exactly the same state as master,
     so if there are concurrent updates to the same key, replicas need to receive them in the same order as they were applied in master,
@@ -363,7 +373,7 @@ fn do_xadd(connection: &mut Connection, key: StorageKey, item: StreamEntry, comm
      */
     let Some(guard) = connection.server.storage.append_to_stream(key, item) else {
         eprintln!("can't do xadd when key is not a stream");
-        return Err(INVALID_ARGS_DEFAULT);
+        return Err(ArgsError::Generic);
     };
     connection.replicate(command);
     drop(guard); // guard is unused, it just needs to exist until the end of scope
@@ -379,7 +389,7 @@ async fn incr(connection: &mut Connection, command: Command) -> HandleResult<()>
     let key = key.clone();
     if let Some(transaction) = connection.get_transaction_mut() {
         if transaction.started {
-            transaction.queue.push(QueuedCommand::Incr{key});
+            transaction.queue.push(QueuedCommand::Incr{key, command});
             return write_simple_string(&mut connection.stream, "QUEUED").await
                 .ok_or(HandleError::ResponseFailed);
         }
@@ -393,7 +403,7 @@ async fn incr(connection: &mut Connection, command: Command) -> HandleResult<()>
     }
 }
 
-fn do_incr(connection: &mut Connection, key: StorageKey, command: Command) -> HandleResult<i64> {
+fn do_incr(connection: &mut Connection, key: StorageKey, command: Command) -> ExecResult<i64> {
     /*
     We need to ensure that replicas have exactly the same state as master,
     so if there are concurrent updates to the same key, replicas need to receive them in the same order as they were applied in master,
@@ -401,7 +411,7 @@ fn do_incr(connection: &mut Connection, key: StorageKey, command: Command) -> Ha
      */
     let Some((guard, value)) = connection.server.storage.increment(key) else {
         eprintln!("can't do incr when key is not an int");
-        return Err(HandleError::InvalidArgs(ArgsError::CanNotIncrementThisValue));
+        return Err(ArgsError::CanNotIncrementThisValue);
     };
     connection.replicate(command);
     drop(guard); // guard is unused, it just needs to exist until the end of scope
@@ -416,6 +426,59 @@ async fn multi(connection: &mut Connection) -> HandleResult<()> {
     transaction.started = true;
     write_simple_string(&mut connection.stream, "OK").await
         .ok_or(HandleError::ResponseFailed)
+}
+
+async fn exec(connection: &mut Connection) -> HandleResult<()> {
+    let Some(transaction) = connection.get_transaction_mut() else {
+        eprintln!("exec command was called on a wrong type of connection");
+        return Err(INVALID_ARGS_DEFAULT);
+    };
+    if !transaction.started {
+        return Err(HandleError::InvalidArgs(ArgsError::ExecWithoutMulti));
+    }
+    
+    transaction.started = false;
+    let queue = mem::replace(&mut transaction.queue, vec![]);
+    let queue_size = queue.len();
+    
+    write_array_size(&mut connection.stream, queue_size).await
+        .ok_or(HandleError::ResponseFailed)?;
+    for command in queue {
+        match command {
+            QueuedCommand::Set { key, item, command } => {
+                do_set(connection, key, item, command);
+                write_simple_string(&mut connection.stream, "OK").await
+                    .ok_or(HandleError::ResponseFailed)?;
+            }
+            QueuedCommand::Xadd { key, item, command } => {
+                let res = do_xadd(connection, key, item, command);
+                match res {
+                    Ok(_) => {
+                        write_simple_string(&mut connection.stream, "OK").await
+                            .ok_or(HandleError::ResponseFailed)?;
+                    },
+                    Err(err) => {
+                        write_simple_error(&mut connection.stream, err.get_message()).await
+                            .ok_or(HandleError::ResponseFailed)?;
+                    },
+                }
+            }
+            QueuedCommand::Incr { key, command } => {
+                let res = do_incr(connection, key, command);
+                match res {
+                    Ok(new_value) => {
+                        write_int(&mut connection.stream, new_value).await
+                            .ok_or(HandleError::ResponseFailed)?;
+                    },
+                    Err(err) => {
+                        write_simple_error(&mut connection.stream, err.get_message()).await
+                            .ok_or(HandleError::ResponseFailed)?;
+                    },
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn split_subcommand(args: &[Vec<u8>]) -> HandleResult<(String, &[Vec<u8>])> {

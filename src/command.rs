@@ -1,6 +1,6 @@
 pub(crate) type CommandRaw = (Vec<Vec<u8>>, usize);
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct Command {
     pub byte_size: usize,
     pub name: String,
