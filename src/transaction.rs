@@ -13,4 +13,5 @@ pub(crate) enum QueuedCommand {
     Set{key: StorageKey, item: StorageItemSimple, command: Command},
     Xadd{key: StorageKey, item: StreamEntry, command: Command},
     Incr{key: StorageKey, command: Command},
+    Get{key: StorageKey},
 }

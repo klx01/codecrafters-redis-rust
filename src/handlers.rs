@@ -105,6 +105,18 @@ async fn echo(connection: &mut Connection, command: Command) -> HandleResult<()>
 
 async fn get(connection: &mut Connection, command: Command) -> HandleResult<()> {
     let (key, _) = split_arg(command.get_args())?;
+    if let Some(transaction) = connection.get_transaction_mut() {
+        if transaction.started {
+            let key = key.clone();
+            transaction.queue.push(QueuedCommand::Get{key});
+            return write_simple_string(&mut connection.stream, "QUEUED").await
+                .ok_or(HandleError::ResponseFailed);
+        }
+    }
+    exec_get(connection, key).await
+}
+
+async fn exec_get(connection: &mut Connection, key: &StorageKey) -> HandleResult<()> {
     let result = connection.server.storage.get_simple(key);
     let stream = &mut connection.stream;
     match result {
@@ -445,6 +457,9 @@ async fn exec(connection: &mut Connection) -> HandleResult<()> {
         .ok_or(HandleError::ResponseFailed)?;
     for command in queue {
         match command {
+            QueuedCommand::Get { key } => {
+                exec_get(connection, &key).await?
+            }
             QueuedCommand::Set { key, item, command } => {
                 do_set(connection, key, item, command);
                 write_simple_string(&mut connection.stream, "OK").await
