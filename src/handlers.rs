@@ -30,6 +30,7 @@ pub(crate) enum ArgsError {
     Generic,
     CanNotIncrementThisValue,
     ExecWithoutMulti,
+    DiscardWithoutMulti,
 }
 impl ArgsError {
     pub(crate) fn get_message(&self) -> &'static str {
@@ -37,6 +38,7 @@ impl ArgsError {
             ArgsError::Generic => "Invalid args",
             ArgsError::CanNotIncrementThisValue => "ERR value is not an integer or out of range",
             ArgsError::ExecWithoutMulti => "ERR EXEC without MULTI",
+            ArgsError::DiscardWithoutMulti => "ERR DISCARD without MULTI",
         }
     }
 }
@@ -81,6 +83,7 @@ pub(crate) async fn handle_command(connection: &mut Connection, command: Command
         "INCR" => incr(connection, command).await,
         "MULTI" => multi(connection).await,
         "EXEC" => exec(connection).await,
+        "DISCARD" => discard(connection).await,
         _ => {
             eprintln!("received unknown command {} {:?}", command.name, command.raw);
             Err(INVALID_ARGS_DEFAULT)
@@ -448,11 +451,11 @@ async fn exec(connection: &mut Connection) -> HandleResult<()> {
     if !transaction.started {
         return Err(HandleError::InvalidArgs(ArgsError::ExecWithoutMulti));
     }
-    
+
     transaction.started = false;
     let queue = mem::replace(&mut transaction.queue, vec![]);
     let queue_size = queue.len();
-    
+
     write_array_size(&mut connection.stream, queue_size).await
         .ok_or(HandleError::ResponseFailed)?;
     for command in queue {
@@ -494,6 +497,22 @@ async fn exec(connection: &mut Connection) -> HandleResult<()> {
         }
     }
     Ok(())
+}
+
+async fn discard(connection: &mut Connection) -> HandleResult<()> {
+    let Some(transaction) = connection.get_transaction_mut() else {
+        eprintln!("discard command was called on a wrong type of connection");
+        return Err(INVALID_ARGS_DEFAULT);
+    };
+    if !transaction.started {
+        return Err(HandleError::InvalidArgs(ArgsError::DiscardWithoutMulti));
+    }
+
+    transaction.started = false;
+    transaction.queue = vec![];
+    
+    write_simple_string(&mut connection.stream, "OK").await
+        .ok_or(HandleError::ResponseFailed)
 }
 
 fn split_subcommand(args: &[Vec<u8>]) -> HandleResult<(String, &[Vec<u8>])> {
